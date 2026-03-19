@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Indexador — Dashboard</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <nav>
+      <span class="brand">Indexador DXF</span>
+      <a href="/" class="active">Dashboard</a>
+      <a href="/mappings.html">Mapeamentos</a>
+      <a href="/settings.html">Configurações</a>
+    </nav>
+
+    <main>
+      <h1>Dashboard</h1>
+
+      <div class="card">
+        <div id="config-warning" class="alert alert-info" style="display: none">
+          ERP ainda não configurado.
+          <a href="/settings.html" style="color: #1d4ed8; font-weight: 600"
+            >Configure agora &rarr;</a
+          >
+        </div>
+
+        <div style="display: flex; gap: 10px; margin-bottom: 20px">
+          <button id="btn-sync" class="btn btn-success" onclick="startSync()">
+            &#9654; Sincronizar agora
+          </button>
+          <button class="btn btn-ghost" onclick="loadStatus()">
+            &#8635; Atualizar status
+          </button>
+        </div>
+
+        <div id="syncing-msg" style="display: none" class="alert alert-info">
+          <span class="spinning" style="display: inline-block">&#9696;</span>
+          &nbsp;Sincronizando...
+        </div>
+
+        <div id="status-area">
+          <p style="color: #6b7280">Nenhuma sincronização realizada ainda.</p>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      async function loadStatus() {
+        const res = await fetch("/api/sync/status");
+        const data = await res.json();
+        renderStatus(data);
+      }
+
+      async function loadConfig() {
+        const res = await fetch("/api/config");
+        const cfg = await res.json();
+        if (!cfg.erpApiUrl) {
+          document.getElementById("config-warning").style.display = "";
+        }
+      }
+
+      function renderStatus(data) {
+        const area = document.getElementById("status-area");
+        if (!data) {
+          area.innerHTML =
+            '<p style="color:#6b7280">Nenhuma sincronização realizada ainda.</p>';
+          return;
+        }
+
+        const ok = data.results.filter((r) => r.push && r.push.ok).length;
+        const fail = data.results.filter((r) => r.push && !r.push.ok).length;
+        const totalFiles = data.results.reduce(
+          (s, r) => s + (r.scannedFiles || 0),
+          0,
+        );
+
+        area.innerHTML = `
+        <p style="font-size:12px;color:#6b7280;margin-bottom:12px">
+          Última sincronização: <strong>${new Date(data.finishedAt).toLocaleString("pt-BR")}</strong>
+          &nbsp;(${data.durationMs}ms)
+        </p>
+        <div class="stat-grid">
+          <div class="stat-box"><div class="stat-val">${data.totalMappings}</div><div class="stat-lbl">Mapeamentos</div></div>
+          <div class="stat-box"><div class="stat-val">${totalFiles}</div><div class="stat-lbl">Arquivos indexados</div></div>
+          <div class="stat-box"><div class="stat-val" style="color:${fail > 0 ? "#dc2626" : "#16a34a"}">${fail > 0 ? fail + " erro(s)" : "OK"}</div><div class="stat-lbl">Status envio</div></div>
+        </div>
+        <div>
+          ${data.results
+            .map(
+              (r) => `
+            <div class="result-item">
+              <div class="folder">${escHtml(r.customerName || r.customerId)}</div>
+              <div class="detail mono">${escHtml(r.folder)}</div>
+              <div class="detail" style="margin-top:3px">
+                ${r.scannedFiles} arquivo(s) encontrado(s) &nbsp;|&nbsp;
+                ${
+                  r.push && r.push.ok
+                    ? `<span class="badge badge-green">&#10003; Enviado (${r.push.synced})</span>`
+                    : `<span class="badge badge-red">&#10007; Falha: ${escHtml((r.push && r.push.error) || "?")}</span>`
+                }
+                ${
+                  r.warnings && r.warnings.length > 0
+                    ? `<span class="badge badge-gray" style="margin-left:4px">${r.warnings.length} aviso(s)</span>`
+                    : ""
+                }
+              </div>
+            </div>
+          `,
+            )
+            .join("")}
+        </div>
+      `;
+      }
+
+      async function startSync() {
+        document.getElementById("btn-sync").disabled = true;
+        document.getElementById("syncing-msg").style.display = "";
+        document.getElementById("status-area").innerHTML = "";
+
+        try {
+          const res = await fetch("/api/sync", { method: "POST" });
+          const data = await res.json();
+          if (!res.ok) {
+            document.getElementById("status-area").innerHTML =
+              `<div class="alert alert-error">${escHtml(data.error || "Erro desconhecido")}</div>`;
+          } else {
+            renderStatus(data);
+          }
+        } catch (err) {
+          document.getElementById("status-area").innerHTML =
+            `<div class="alert alert-error">Erro de rede: ${escHtml(err.message)}</div>`;
+        } finally {
+          document.getElementById("btn-sync").disabled = false;
+          document.getElementById("syncing-msg").style.display = "none";
+        }
+      }
+
+      function escHtml(str) {
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      loadConfig();
+      loadStatus();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Indexador — Mapeamentos</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <nav>
+      <span class="brand">Indexador DXF</span>
+      <a href="/">Dashboard</a>
+      <a href="/mappings.html" class="active">Mapeamentos</a>
+      <a href="/settings.html">Configurações</a>
+    </nav>
+
+    <main>
+      <h1>Mapeamentos</h1>
+
+      <div class="card">
+        <h2>Adicionar mapeamento</h2>
+        <p style="color: #6b7280; font-size: 12px; margin-bottom: 14px">
+          Associe uma pasta local a um cliente do ERP. No Windows use caminhos
+          absolutos, ex: <span class="mono">C:\clientes\Cutelaria ABC</span>
+        </p>
+
+        <div id="add-msg"></div>
+
+        <div class="add-form">
+          <div class="form-row" style="margin: 0">
+            <label>Pasta local (caminho absoluto)</label>
+            <input
+              type="text"
+              id="inp-folder"
+              placeholder="C:\clientes\Cutelaria ABC"
+            />
+          </div>
+          <div class="form-row" style="margin: 0">
+            <label>Cliente do ERP</label>
+            <select id="sel-customer">
+              <option value="">Carregando clientes...</option>
+            </select>
+          </div>
+          <div>
+            <label style="visibility: hidden">.</label>
+            <button class="btn btn-primary" onclick="addMapping()">
+              Adicionar
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Mapeamentos configurados</h2>
+        <div id="list-msg"></div>
+        <div id="mappings-table">
+          <p style="color: #6b7280">Carregando...</p>
+        </div>
+      </div>
+    </main>
+
+    <script>
+      let customers = [];
+
+      async function loadCustomers() {
+        const sel = document.getElementById("sel-customer");
+        try {
+          const res = await fetch("/api/customers");
+          const data = await res.json();
+          if (!res.ok) {
+            sel.innerHTML = `<option value="">Erro: ${escHtml(data.error)}</option>`;
+            return;
+          }
+          customers = data;
+          sel.innerHTML =
+            customers.length === 0
+              ? '<option value="">Nenhum cliente cadastrado no ERP</option>'
+              : customers
+                  .map(
+                    (c) =>
+                      `<option value="${escHtml(c.id)}">${escHtml(c.name)}${c.company ? ` (${escHtml(c.company)})` : ""}</option>`,
+                  )
+                  .join("");
+        } catch (err) {
+          sel.innerHTML = `<option value="">Falha ao conectar: ${escHtml(err.message)}</option>`;
+        }
+      }
+
+      async function loadMappings() {
+        const res = await fetch("/api/mappings");
+        const mappings = await res.json();
+        renderMappings(mappings);
+      }
+
+      function renderMappings(mappings) {
+        const container = document.getElementById("mappings-table");
+        if (mappings.length === 0) {
+          container.innerHTML =
+            '<p style="color:#6b7280">Nenhum mapeamento configurado.</p>';
+          return;
+        }
+
+        container.innerHTML = `
+        <table>
+          <thead>
+            <tr>
+              <th>Pasta local</th>
+              <th>Cliente</th>
+              <th style="width:60px"></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${mappings
+              .map(
+                (m, i) => `
+              <tr>
+                <td class="mono" style="word-break:break-all">${escHtml(m.folder)}</td>
+                <td>${escHtml(m.customerName || m.customerId)}</td>
+                <td>
+                  <button class="btn btn-danger" onclick="removeMapping(${i})">Remover</button>
+                </td>
+              </tr>
+            `,
+              )
+              .join("")}
+          </tbody>
+        </table>
+      `;
+      }
+
+      async function addMapping() {
+        const folder = document.getElementById("inp-folder").value.trim();
+        const sel = document.getElementById("sel-customer");
+        const customerId = sel.value;
+        const customerName = sel.options[sel.selectedIndex]?.text || "";
+        const msgEl = document.getElementById("add-msg");
+
+        if (!folder) {
+          msgEl.innerHTML =
+            '<div class="alert alert-error">Informe o caminho da pasta.</div>';
+          return;
+        }
+        if (!customerId) {
+          msgEl.innerHTML =
+            '<div class="alert alert-error">Selecione um cliente.</div>';
+          return;
+        }
+
+        const res = await fetch("/api/mappings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ folder, customerId, customerName }),
+        });
+        const data = await res.json();
+
+        if (!res.ok) {
+          msgEl.innerHTML = `<div class="alert alert-error">${escHtml(data.error)}</div>`;
+          return;
+        }
+
+        msgEl.innerHTML =
+          '<div class="alert alert-success">Mapeamento adicionado.</div>';
+        document.getElementById("inp-folder").value = "";
+        renderMappings(data.mappings);
+        setTimeout(() => {
+          msgEl.innerHTML = "";
+        }, 3000);
+      }
+
+      async function removeMapping(idx) {
+        if (!confirm("Remover este mapeamento?")) return;
+        const res = await fetch(`/api/mappings/${idx}`, { method: "DELETE" });
+        const data = await res.json();
+        if (res.ok) {
+          renderMappings(data.mappings);
+        } else {
+          document.getElementById("list-msg").innerHTML =
+            `<div class="alert alert-error">${escHtml(data.error)}</div>`;
+        }
+      }
+
+      function escHtml(str) {
+        return String(str)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      loadCustomers();
+      loadMappings();
+    </script>
+  </body>
+</html>
