@@ -3,178 +3,252 @@
 const express = require("express");
 const path = require("path");
 const { readConfig, writeConfig } = require("./lib/config");
-const { scanFolder } = require("./lib/scanner");
-const { pushFilesToErp } = require("./lib/sync");
+const { discoverCustomers, scanFolder, isRootAccessible } = require("./lib/scanner");
+const { checkBackendHealth, uploadThumbToErp, batchSyncToErp } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 
 const PORT = process.env.PORT || 4000;
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+const state = {
+  running: false,
+  lastSync: null,
+  lastDurationMs: null,
+  lastError: null,
+  cycleCount: 0,
+};
+
+let syncTimer = null;
+
+// ---------------------------------------------------------------------------
+// Sync cycle
+// ---------------------------------------------------------------------------
+
+async function runSyncCycle() {
+  if (state.running) {
+    console.log("[sync] Cycle already running, skipping");
+    return;
+  }
+
+  state.running = true;
+  state.cycleCount++;
+  const cycleNum = state.cycleCount;
+  const startedAt = Date.now();
+
+  console.log(`\n${"=".repeat(60)}`);
+  console.log(`[sync] Cycle #${cycleNum} START`);
+  console.log(`${"=".repeat(60)}`);
+
+  try {
+    const config = await readConfig();
+
+    if (!config.erpApiUrl || !config.apiKey) {
+      console.error("[sync] Missing erpApiUrl or apiKey in config");
+      return;
+    }
+
+    if (!config.roots || config.roots.length === 0) {
+      console.error("[sync] No roots configured");
+      return;
+    }
+
+    const healthy = await checkBackendHealth(config.erpApiUrl);
+    if (!healthy) {
+      console.error("[sync] Backend unreachable, skipping cycle");
+      state.lastError = "Backend unreachable";
+      return;
+    }
+
+    let totalFiles = 0;
+    let totalCustomers = 0;
+    let totalCreated = 0;
+    let totalUpdated = 0;
+    let totalDeleted = 0;
+    let totalErrors = 0;
+
+    for (const root of config.roots) {
+      console.log(`\n[root] ${root.path} (${root.sourceType})`);
+
+      const accessible = await isRootAccessible(root.path);
+      if (!accessible) {
+        console.error(`[root] INACCESSIBLE: ${root.path} — skipping`);
+        totalErrors++;
+        continue;
+      }
+
+      let customers;
+      try {
+        customers = await discoverCustomers(root.path);
+      } catch (err) {
+        console.error(`[root] Failed to discover customers: ${err.message}`);
+        totalErrors++;
+        continue;
+      }
+
+      console.log(`[root] Found ${customers.length} customer folders`);
+
+      for (const customerFolder of customers) {
+        const customerPath = path.join(root.path, customerFolder);
+
+        const { files, warnings } = await scanFolder(
+          customerPath,
+          root.sourceType,
+          customerFolder,
+        );
+
+        if (warnings.length > 0) {
+          for (const w of warnings) {
+            console.warn(`[scan] ${w.type}: ${w.message}`);
+          }
+        }
+
+        if (files.length === 0) continue;
+
+        totalCustomers++;
+        totalFiles += files.length;
+
+        // Gerar thumbnails (READ-ONLY no filesystem de origem)
+        const filesWithThumbs = await generateThumbsForFiles(
+          files,
+          customerPath,
+          config.thumbConcurrency || 4,
+        );
+
+        // Upload de thumbnails novos ao backend
+        for (const file of filesWithThumbs) {
+          if (file.thumbnailPath && !file.thumbCached) {
+            const uploadResult = await uploadThumbToErp(
+              config.erpApiUrl,
+              config.apiKey,
+              file.id,
+              file.thumbnailPath,
+            );
+            if (uploadResult.ok) {
+              file.thumbnailUrl = uploadResult.thumbnailUrl;
+            } else {
+              console.warn(
+                `[thumb] Upload failed for ${file.fileName}: ${uploadResult.error}`,
+              );
+            }
+          }
+        }
+
+        // Batch sync para o backend
+        const syncPayload = filesWithThumbs.map((f) => ({
+          fileName: f.fileName,
+          relativePath: f.relativePath,
+          extension: f.extension,
+          sizeBytes: f.sizeBytes,
+          lastModifiedAt: f.lastModifiedAt,
+          thumbnailUrl: f.thumbnailUrl || null,
+        }));
+
+        const syncResult = await batchSyncToErp(
+          config.erpApiUrl,
+          config.apiKey,
+          customerFolder,
+          root.sourceType,
+          syncPayload,
+        );
+
+        if (syncResult.ok) {
+          const d = syncResult.data;
+          if (d.created || d.updated || d.deleted) {
+            console.log(
+              `[sync] ${customerFolder}: +${d.created} ~${d.updated} -${d.deleted} (${d.total} total)`,
+            );
+          }
+          totalCreated += d.created || 0;
+          totalUpdated += d.updated || 0;
+          totalDeleted += d.deleted || 0;
+        } else {
+          console.error(
+            `[sync] FAILED ${customerFolder}: ${syncResult.error}`,
+          );
+          totalErrors++;
+        }
+      }
+    }
+
+    const durationMs = Date.now() - startedAt;
+
+    config.lastSync = new Date().toISOString();
+    await writeConfig(config);
+
+    state.lastSync = config.lastSync;
+    state.lastDurationMs = durationMs;
+    state.lastError = totalErrors > 0 ? `${totalErrors} errors` : null;
+
+    console.log(`\n${"─".repeat(60)}`);
+    console.log(`[sync] Cycle #${cycleNum} DONE in ${(durationMs / 1000).toFixed(1)}s`);
+    console.log(
+      `[sync] customers=${totalCustomers} files=${totalFiles} +${totalCreated} ~${totalUpdated} -${totalDeleted} errors=${totalErrors}`,
+    );
+    console.log(`${"─".repeat(60)}\n`);
+  } catch (err) {
+    console.error(`[sync] Cycle #${cycleNum} CRASHED: ${err.message}`);
+    state.lastError = err.message;
+  } finally {
+    state.running = false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP (minimal — status only)
+// ---------------------------------------------------------------------------
+
 const app = express();
 
-app.use(express.json());
-app.use(express.static(path.join(__dirname, "public")));
-app.use("/thumbs", express.static(path.join(__dirname, "thumbs")));
-
-// Estado em memória do último sync
-let syncStatus = null;
-let syncing = false;
-
-// ─── Config ──────────────────────────────────────────────────────────────────
-
-app.get("/api/config", async (_req, res) => {
-  const config = await readConfig();
-  res.json({ erpApiUrl: config.erpApiUrl, apiKey: config.apiKey });
-});
-
-app.post("/api/config", async (req, res) => {
-  const { erpApiUrl, apiKey } = req.body;
-  if (typeof erpApiUrl !== "string" || typeof apiKey !== "string") {
-    return res
-      .status(400)
-      .json({ error: "erpApiUrl e apiKey são obrigatórios" });
-  }
-  const config = await readConfig();
-  config.erpApiUrl = erpApiUrl.trim();
-  config.apiKey = apiKey.trim();
-  await writeConfig(config);
-  res.json({ ok: true });
-});
-
-// ─── Mapeamentos ─────────────────────────────────────────────────────────────
-
-app.get("/api/mappings", async (_req, res) => {
-  const config = await readConfig();
-  res.json(config.mappings);
-});
-
-app.post("/api/mappings", async (req, res) => {
-  const { folder, customerId, customerName } = req.body;
-  if (!folder || !customerId) {
-    return res
-      .status(400)
-      .json({ error: "folder e customerId são obrigatórios" });
-  }
-  const config = await readConfig();
-  const already = config.mappings.find(
-    (m) => m.folder === folder && m.customerId === customerId,
-  );
-  if (already) {
-    return res.status(409).json({ error: "Mapeamento já existe" });
-  }
-  config.mappings.push({
-    folder: folder.trim(),
-    customerId,
-    customerName: customerName || "",
+app.get("/health", (_req, res) => {
+  res.json({
+    status: "ok",
+    ...state,
   });
-  await writeConfig(config);
-  res.json({ ok: true, mappings: config.mappings });
 });
 
-app.delete("/api/mappings/:idx", async (req, res) => {
-  const idx = parseInt(req.params.idx, 10);
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+async function main() {
   const config = await readConfig();
-  if (isNaN(idx) || idx < 0 || idx >= config.mappings.length) {
-    return res.status(404).json({ error: "Índice inválido" });
-  }
-  config.mappings.splice(idx, 1);
-  await writeConfig(config);
-  res.json({ ok: true, mappings: config.mappings });
-});
+  const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
 
-// ─── Clientes (proxy para o ERP) ─────────────────────────────────────────────
+  console.log("[indexer] Starting DXF File Indexer");
+  console.log(`[indexer] Backend: ${config.erpApiUrl}`);
+  console.log(`[indexer] Roots: ${config.roots.map((r) => `${r.path} (${r.sourceType})`).join(", ")}`);
+  console.log(`[indexer] Sync interval: ${config.syncIntervalMinutes || 15}min`);
+  console.log(`[indexer] Health endpoint: http://localhost:${PORT}/health`);
+  console.log("");
 
-app.get("/api/customers", async (_req, res) => {
-  const config = await readConfig();
-  if (!config.erpApiUrl) {
-    return res
-      .status(400)
-      .json({ error: "ERP não configurado. Acesse Configurações." });
-  }
-  try {
-    const response = await fetch(
-      `${config.erpApiUrl.replace(/\/$/, "")}/customers`,
-    );
-    if (!response.ok) {
-      return res
-        .status(502)
-        .json({ error: `ERP retornou HTTP ${response.status}` });
-    }
-    const customers = await response.json();
-    res.json(customers);
-  } catch (err) {
-    res
-      .status(502)
-      .json({ error: `Não foi possível conectar ao ERP: ${err.message}` });
-  }
-});
+  app.listen(PORT, "127.0.0.1", () => {
+    console.log(`[indexer] HTTP listening on 127.0.0.1:${PORT}`);
+  });
 
-// ─── Sync ────────────────────────────────────────────────────────────────────
+  // Primeiro ciclo imediato
+  await runSyncCycle();
 
-app.get("/api/sync/status", (_req, res) => {
-  res.json(syncStatus);
-});
+  // Ciclos periódicos
+  syncTimer = setInterval(runSyncCycle, intervalMs);
+}
 
-app.post("/api/sync", async (_req, res) => {
-  if (syncing) {
-    return res.status(409).json({ error: "Sincronização já em andamento" });
-  }
+// ---------------------------------------------------------------------------
+// Signal handling
+// ---------------------------------------------------------------------------
 
-  const config = await readConfig();
-  if (!config.erpApiUrl || !config.apiKey) {
-    return res.status(400).json({
-      error: "Configure a URL do ERP e a API Key antes de sincronizar.",
-    });
-  }
-  if (config.mappings.length === 0) {
-    return res.status(400).json({ error: "Nenhum mapeamento configurado." });
-  }
+function shutdown(signal) {
+  console.log(`\n[indexer] ${signal} received, shutting down...`);
+  if (syncTimer) clearInterval(syncTimer);
+  process.exit(0);
+}
 
-  syncing = true;
-  const startedAt = Date.now();
-  const results = [];
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
-  try {
-    for (const mapping of config.mappings) {
-      const { files, warnings } = await scanFolder(mapping.folder);
-      const filesWithThumbs = await generateThumbsForFiles(
-        files,
-        mapping.folder,
-      );
-      const pushResult = await pushFilesToErp(
-        config.erpApiUrl,
-        config.apiKey,
-        mapping.customerId,
-        filesWithThumbs,
-      );
-
-      results.push({
-        folder: mapping.folder,
-        customerId: mapping.customerId,
-        customerName: mapping.customerName || mapping.customerId,
-        scannedFiles: files.length,
-        warnings,
-        push: pushResult,
-      });
-    }
-
-    syncStatus = {
-      finishedAt: new Date().toISOString(),
-      durationMs: Date.now() - startedAt,
-      totalMappings: config.mappings.length,
-      results,
-    };
-
-    config.lastSync = syncStatus.finishedAt;
-    await writeConfig(config);
-  } finally {
-    syncing = false;
-  }
-
-  res.json(syncStatus);
-});
-
-// ─── Inicialização ───────────────────────────────────────────────────────────
-
-app.listen(PORT, "127.0.0.1", () => {
-  console.log(`Indexador rodando em http://localhost:${PORT}`);
-  console.log("Abra o endereço acima no navegador para acessar a interface.");
+main().catch((err) => {
+  console.error(`[indexer] Fatal startup error: ${err.message}`);
+  process.exit(1);
 });

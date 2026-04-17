@@ -10,7 +10,8 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "form-data": "^4.0.5"
   },
   "keywords": [],
   "author": "",
