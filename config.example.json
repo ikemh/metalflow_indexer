@@ -1,0 +1,17 @@
+{
+  "erpApiUrl": "https://erp.seudominio.com.br",
+  "apiKey": "MESMA_CHAVE_DO_INDEXER_API_KEY_NO_BACKEND",
+  "syncIntervalMinutes": 15,
+  "thumbConcurrency": 4,
+  "roots": [
+    {
+      "path": "Z:\\Clientes",
+      "sourceType": "ATACADO"
+    },
+    {
+      "path": "Z:\\Clientes pedido parcial",
+      "sourceType": "VAREJO"
+    }
+  ],
+  "lastSync": null
+}

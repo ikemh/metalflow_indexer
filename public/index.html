@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DXF Indexer — Admin</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #0f172a; --surface: #1e293b; --surface2: #334155;
+      --border: #475569; --text: #e2e8f0; --muted: #94a3b8;
+      --accent: #3b82f6; --accent-hover: #2563eb;
+      --green: #22c55e; --red: #ef4444; --yellow: #eab308;
+      --radius: 8px; --font: system-ui, -apple-system, sans-serif;
+    }
+    body { font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.5; }
+    .container { max-width: 960px; margin: 0 auto; padding: 24px 16px; }
+    h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 24px; display: flex; align-items: center; gap: 12px; }
+    h2 { font-size: 1.1rem; font-weight: 600; margin-bottom: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; font-size: 0.8rem; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .stat { background: var(--surface2); border-radius: var(--radius); padding: 14px; }
+    .stat-label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
+    .stat-value { font-size: 1.25rem; font-weight: 700; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 0.75rem; font-weight: 600; }
+    .badge-green { background: rgba(34,197,94,0.15); color: var(--green); }
+    .badge-red { background: rgba(239,68,68,0.15); color: var(--red); }
+    .badge-yellow { background: rgba(234,179,8,0.15); color: var(--yellow); }
+    .badge-blue { background: rgba(59,130,246,0.15); color: var(--accent); }
+    button { font-family: var(--font); cursor: pointer; border: none; border-radius: var(--radius); padding: 8px 16px; font-size: 0.85rem; font-weight: 600; transition: background 0.15s; }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-danger { background: var(--red); color: #fff; }
+    .btn-danger:hover { background: #dc2626; }
+    .btn-sm { padding: 4px 10px; font-size: 0.75rem; }
+    input, select { font-family: var(--font); background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: var(--radius); padding: 8px 12px; font-size: 0.85rem; width: 100%; }
+    input:focus, select:focus { outline: none; border-color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    th { text-align: left; padding: 8px 12px; color: var(--muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid var(--border); }
+    td { padding: 8px 12px; border-bottom: 1px solid var(--surface2); }
+    .log-entry { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 0.78rem; padding: 3px 0; border-bottom: 1px solid var(--surface2); display: flex; gap: 8px; }
+    .log-ts { color: var(--muted); flex-shrink: 0; width: 80px; }
+    .log-level { flex-shrink: 0; width: 45px; font-weight: 600; }
+    .log-level.info { color: var(--accent); }
+    .log-level.warn { color: var(--yellow); }
+    .log-level.error { color: var(--red); }
+    .log-msg { word-break: break-all; }
+    .log-box { max-height: 300px; overflow-y: auto; }
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; }
+    .tab { padding: 6px 14px; border-radius: var(--radius) var(--radius) 0 0; background: var(--surface2); color: var(--muted); font-size: 0.8rem; font-weight: 600; cursor: pointer; border: none; font-family: var(--font); }
+    .tab.active { background: var(--surface); color: var(--text); }
+    .form-row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+    .form-row input { flex: 1; }
+    .form-row select { width: 140px; flex-shrink: 0; }
+    .hidden { display: none !important; }
+    .flex-between { display: flex; justify-content: space-between; align-items: center; }
+    .mb-8 { margin-bottom: 8px; }
+    .empty { color: var(--muted); font-style: italic; font-size: 0.85rem; padding: 16px 0; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>
+      <span>DXF Indexer</span>
+      <span id="statusBadge" class="badge badge-blue">...</span>
+    </h1>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="roots">Roots</button>
+      <button class="tab" data-tab="folders">Pastas</button>
+      <button class="tab" data-tab="config">Config</button>
+      <button class="tab" data-tab="logs">Logs</button>
+    </div>
+
+    <!-- Dashboard -->
+    <div id="tab-dashboard">
+      <div class="grid">
+        <div class="stat">
+          <div class="stat-label">Status</div>
+          <div class="stat-value" id="syncStatus">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Último sync</div>
+          <div class="stat-value" id="lastSync">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Duração</div>
+          <div class="stat-value" id="lastDuration">—</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Ciclos</div>
+          <div class="stat-value" id="cycleCount">0</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Roots</div>
+          <div class="stat-value" id="rootCount">0</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Pastas encontradas</div>
+          <div class="stat-value" id="folderCount">0</div>
+        </div>
+      </div>
+
+      <div class="flex-between mb-8">
+        <div id="lastError" style="color: var(--red); font-size: 0.85rem;"></div>
+        <button class="btn-primary" id="btnSync" onclick="triggerSync()">Sincronizar agora</button>
+      </div>
+    </div>
+
+    <!-- Roots -->
+    <div id="tab-roots" class="hidden">
+      <div class="card">
+        <h2>Roots configurados</h2>
+        <div id="rootsList"></div>
+
+        <h2 style="margin-top:16px">Adicionar root</h2>
+        <div class="form-row">
+          <input type="text" id="newRootPath" placeholder="Caminho (ex: Z:\Clientes)">
+          <select id="newRootType">
+            <option value="ATACADO">ATACADO</option>
+            <option value="VAREJO">VAREJO</option>
+          </select>
+          <button class="btn-primary btn-sm" onclick="addRoot()">Adicionar</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Folders -->
+    <div id="tab-folders" class="hidden">
+      <div class="card">
+        <h2>Pastas descobertas (último ciclo)</h2>
+        <div id="foldersTable"></div>
+      </div>
+    </div>
+
+    <!-- Config -->
+    <div id="tab-config" class="hidden">
+      <div class="card">
+        <h2>Configurações gerais</h2>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Backend URL</label>
+          <input type="text" id="cfgErpUrl">
+        </div>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">API Key</label>
+          <input type="password" id="cfgApiKey" placeholder="(não exibida)">
+        </div>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Intervalo (min)</label>
+          <input type="number" id="cfgInterval" min="1" max="1440">
+        </div>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Thumb concurrency</label>
+          <input type="number" id="cfgThumbConc" min="1" max="16">
+        </div>
+        <div style="margin-top:12px">
+          <button class="btn-primary" onclick="saveConfig()">Salvar configurações</button>
+          <span id="cfgSaveMsg" style="margin-left:8px;font-size:0.8rem;color:var(--green)"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Logs -->
+    <div id="tab-logs" class="hidden">
+      <div class="card">
+        <div class="flex-between mb-8">
+          <h2>Logs recentes</h2>
+          <select id="logFilter" onchange="loadLogs()" style="width:120px">
+            <option value="">Todos</option>
+            <option value="error">Erros</option>
+            <option value="warn">Avisos</option>
+            <option value="info">Info</option>
+          </select>
+        </div>
+        <div class="log-box" id="logBox"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const API = '';
+
+// --- Tabs ---
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    t.classList.add('active');
+    const id = t.dataset.tab;
+    document.querySelectorAll('[id^="tab-"]').forEach(p => p.classList.add('hidden'));
+    document.getElementById('tab-' + id).classList.remove('hidden');
+
+    if (id === 'logs') loadLogs();
+    if (id === 'roots') loadRoots();
+    if (id === 'config') loadConfig();
+    if (id === 'folders') loadFolders();
+  });
+});
+
+// --- Status polling ---
+async function loadStatus() {
+  try {
+    const r = await fetch(API + '/api/status');
+    const d = await r.json();
+
+    const badge = document.getElementById('statusBadge');
+    const statusEl = document.getElementById('syncStatus');
+
+    if (d.running) {
+      badge.textContent = 'Sincronizando';
+      badge.className = 'badge badge-yellow';
+      statusEl.textContent = 'Em execução';
+    } else if (d.lastError) {
+      badge.textContent = 'Erro';
+      badge.className = 'badge badge-red';
+      statusEl.textContent = 'Erro';
+    } else {
+      badge.textContent = 'OK';
+      badge.className = 'badge badge-green';
+      statusEl.textContent = 'Ocioso';
+    }
+
+    document.getElementById('lastSync').textContent = d.lastSync ? fmtDate(d.lastSync) : '—';
+    document.getElementById('lastDuration').textContent = d.lastDurationMs ? (d.lastDurationMs / 1000).toFixed(1) + 's' : '—';
+    document.getElementById('cycleCount').textContent = d.cycleCount;
+    document.getElementById('rootCount').textContent = d.rootCount;
+    document.getElementById('folderCount').textContent = (d.discoveredFolders || []).length;
+    document.getElementById('lastError').textContent = d.lastError || '';
+
+    document.getElementById('btnSync').disabled = d.running;
+  } catch {}
+}
+
+function fmtDate(iso) {
+  const d = new Date(iso);
+  return d.toLocaleString('pt-BR', { day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit' });
+}
+
+// --- Sync ---
+async function triggerSync() {
+  document.getElementById('btnSync').disabled = true;
+  try {
+    await fetch(API + '/api/sync', { method: 'POST' });
+  } catch {}
+  setTimeout(loadStatus, 1000);
+}
+
+// --- Roots ---
+async function loadRoots() {
+  const r = await fetch(API + '/api/roots');
+  const roots = await r.json();
+  const el = document.getElementById('rootsList');
+
+  if (roots.length === 0) {
+    el.innerHTML = '<div class="empty">Nenhum root configurado</div>';
+    return;
+  }
+
+  el.innerHTML = '<table><thead><tr><th>#</th><th>Caminho</th><th>Tipo</th><th></th></tr></thead><tbody>' +
+    roots.map(r => `<tr>
+      <td>${r.index}</td>
+      <td style="word-break:break-all">${esc(r.path)}</td>
+      <td><span class="badge ${r.sourceType === 'ATACADO' ? 'badge-blue' : 'badge-yellow'}">${r.sourceType}</span></td>
+      <td><button class="btn-danger btn-sm" onclick="removeRoot(${r.index})">Remover</button></td>
+    </tr>`).join('') +
+    '</tbody></table>';
+}
+
+async function addRoot() {
+  const p = document.getElementById('newRootPath').value.trim();
+  const t = document.getElementById('newRootType').value;
+  if (!p) return;
+
+  await fetch(API + '/api/roots', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: p, sourceType: t }),
+  });
+
+  document.getElementById('newRootPath').value = '';
+  loadRoots();
+}
+
+async function removeRoot(idx) {
+  if (!confirm('Remover este root?')) return;
+  await fetch(API + '/api/roots/' + idx, { method: 'DELETE' });
+  loadRoots();
+}
+
+// --- Folders ---
+async function loadFolders() {
+  const r = await fetch(API + '/api/status');
+  const d = await r.json();
+  const folders = d.discoveredFolders || [];
+  const el = document.getElementById('foldersTable');
+
+  if (folders.length === 0) {
+    el.innerHTML = '<div class="empty">Nenhuma pasta descoberta ainda. Execute um sync primeiro.</div>';
+    return;
+  }
+
+  el.innerHTML = '<table><thead><tr><th>Pasta</th><th>Tipo</th><th>Arquivos</th><th>Scan completo</th><th>Visto em</th></tr></thead><tbody>' +
+    folders.map(f => `<tr>
+      <td>${esc(f.folderName)}</td>
+      <td><span class="badge ${f.sourceType === 'ATACADO' ? 'badge-blue' : 'badge-yellow'}">${f.sourceType}</span></td>
+      <td>${f.fileCount}</td>
+      <td>${f.isCompleteScan ? '<span class="badge badge-green">Sim</span>' : '<span class="badge badge-red">Não</span>'}</td>
+      <td>${fmtDate(f.lastSeenAt)}</td>
+    </tr>`).join('') +
+    '</tbody></table>';
+}
+
+// --- Config ---
+async function loadConfig() {
+  const r = await fetch(API + '/api/config');
+  const c = await r.json();
+  document.getElementById('cfgErpUrl').value = c.erpApiUrl || '';
+  document.getElementById('cfgInterval').value = c.syncIntervalMinutes || 15;
+  document.getElementById('cfgThumbConc').value = c.thumbConcurrency || 4;
+  document.getElementById('cfgApiKey').value = '';
+  document.getElementById('cfgSaveMsg').textContent = '';
+}
+
+async function saveConfig() {
+  const body = {};
+  const url = document.getElementById('cfgErpUrl').value.trim();
+  const key = document.getElementById('cfgApiKey').value.trim();
+  const interval = parseInt(document.getElementById('cfgInterval').value, 10);
+  const conc = parseInt(document.getElementById('cfgThumbConc').value, 10);
+
+  if (url) body.erpApiUrl = url;
+  if (key) body.apiKey = key;
+  if (interval > 0) body.syncIntervalMinutes = interval;
+  if (conc > 0) body.thumbConcurrency = conc;
+
+  await fetch(API + '/api/config', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  document.getElementById('cfgSaveMsg').textContent = 'Salvo!';
+  setTimeout(() => { document.getElementById('cfgSaveMsg').textContent = ''; }, 2000);
+}
+
+// --- Logs ---
+async function loadLogs() {
+  const level = document.getElementById('logFilter').value;
+  const url = API + '/api/logs' + (level ? '?level=' + level : '');
+  const r = await fetch(url);
+  const logs = await r.json();
+  const el = document.getElementById('logBox');
+
+  if (logs.length === 0) {
+    el.innerHTML = '<div class="empty">Nenhum log ainda</div>';
+    return;
+  }
+
+  el.innerHTML = logs.map(l => `<div class="log-entry">
+    <span class="log-ts">${new Date(l.ts).toLocaleTimeString('pt-BR')}</span>
+    <span class="log-level ${l.level}">${l.level}</span>
+    <span class="log-msg">${esc(l.message)}</span>
+  </div>`).join('');
+
+  el.scrollTop = el.scrollHeight;
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// --- Init ---
+loadStatus();
+setInterval(loadStatus, 5000);
+</script>
+</body>
+</html>

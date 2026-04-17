@@ -3,8 +3,17 @@
 const express = require("express");
 const path = require("path");
 const { readConfig, writeConfig } = require("./lib/config");
-const { discoverCustomers, scanFolder, isRootAccessible } = require("./lib/scanner");
-const { checkBackendHealth, uploadThumbToErp, batchSyncToErp } = require("./lib/sync");
+const {
+  discoverCustomers,
+  scanFolder,
+  isRootAccessible,
+  normalizeRootPath,
+} = require("./lib/scanner");
+const {
+  checkBackendHealth,
+  uploadThumbToErp,
+  batchSyncToErp,
+} = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 
 const PORT = process.env.PORT || 4000;
@@ -19,7 +28,21 @@ const state = {
   lastDurationMs: null,
   lastError: null,
   cycleCount: 0,
+  discoveredFolders: [],
 };
+
+const MAX_LOG_ENTRIES = 200;
+const logBuffer = [];
+
+function pushLog(level, message) {
+  const entry = { ts: new Date().toISOString(), level, message };
+  logBuffer.push(entry);
+  if (logBuffer.length > MAX_LOG_ENTRIES) logBuffer.shift();
+
+  if (level === "error") console.error(message);
+  else if (level === "warn") console.warn(message);
+  else console.log(message);
+}
 
 let syncTimer = null;
 
@@ -29,8 +52,8 @@ let syncTimer = null;
 
 async function runSyncCycle() {
   if (state.running) {
-    console.log("[sync] Cycle already running, skipping");
-    return;
+    pushLog("warn", "[sync] Cycle already running, skipping");
+    return { skipped: true };
   }
 
   state.running = true;
@@ -38,28 +61,26 @@ async function runSyncCycle() {
   const cycleNum = state.cycleCount;
   const startedAt = Date.now();
 
-  console.log(`\n${"=".repeat(60)}`);
-  console.log(`[sync] Cycle #${cycleNum} START`);
-  console.log(`${"=".repeat(60)}`);
+  pushLog("info", `[sync] Cycle #${cycleNum} START`);
 
   try {
     const config = await readConfig();
 
     if (!config.erpApiUrl || !config.apiKey) {
-      console.error("[sync] Missing erpApiUrl or apiKey in config");
-      return;
+      pushLog("error", "[sync] Missing erpApiUrl or apiKey in config");
+      return { error: "Missing config" };
     }
 
     if (!config.roots || config.roots.length === 0) {
-      console.error("[sync] No roots configured");
-      return;
+      pushLog("error", "[sync] No roots configured");
+      return { error: "No roots" };
     }
 
     const healthy = await checkBackendHealth(config.erpApiUrl);
     if (!healthy) {
-      console.error("[sync] Backend unreachable, skipping cycle");
+      pushLog("error", "[sync] Backend unreachable, skipping cycle");
       state.lastError = "Backend unreachable";
-      return;
+      return { error: "Backend unreachable" };
     }
 
     let totalFiles = 0;
@@ -68,13 +89,15 @@ async function runSyncCycle() {
     let totalUpdated = 0;
     let totalDeleted = 0;
     let totalErrors = 0;
+    const folders = [];
 
     for (const root of config.roots) {
-      console.log(`\n[root] ${root.path} (${root.sourceType})`);
+      const normalizedRoot = normalizeRootPath(root.path);
+      pushLog("info", `[root] ${root.path} (${root.sourceType})`);
 
       const accessible = await isRootAccessible(root.path);
       if (!accessible) {
-        console.error(`[root] INACCESSIBLE: ${root.path} — skipping`);
+        pushLog("error", `[root] INACCESSIBLE: ${root.path} — skipping`);
         totalErrors++;
         continue;
       }
@@ -83,12 +106,15 @@ async function runSyncCycle() {
       try {
         customers = await discoverCustomers(root.path);
       } catch (err) {
-        console.error(`[root] Failed to discover customers: ${err.message}`);
+        pushLog(
+          "error",
+          `[root] Failed to discover customers: ${err.message}`,
+        );
         totalErrors++;
         continue;
       }
 
-      console.log(`[root] Found ${customers.length} customer folders`);
+      pushLog("info", `[root] Found ${customers.length} customer folders`);
 
       for (const customerFolder of customers) {
         const customerPath = path.join(root.path, customerFolder);
@@ -99,25 +125,49 @@ async function runSyncCycle() {
           customerFolder,
         );
 
-        if (warnings.length > 0) {
+        const hasWarnings = warnings.length > 0;
+        if (hasWarnings) {
           for (const w of warnings) {
-            console.warn(`[scan] ${w.type}: ${w.message}`);
+            pushLog("warn", `[scan] ${w.type}: ${w.message}`);
           }
         }
 
-        if (files.length === 0) continue;
+        const isCompleteScan = !hasWarnings;
+
+        folders.push({
+          folderName: customerFolder,
+          sourceType: root.sourceType,
+          rootPath: normalizedRoot,
+          fileCount: files.length,
+          isCompleteScan,
+          lastSeenAt: new Date().toISOString(),
+        });
 
         totalCustomers++;
         totalFiles += files.length;
 
-        // Gerar thumbnails (READ-ONLY no filesystem de origem)
+        if (files.length === 0) {
+          const emptyResult = await batchSyncToErp(
+            config.erpApiUrl,
+            config.apiKey,
+            customerFolder,
+            root.sourceType,
+            normalizedRoot,
+            isCompleteScan,
+            [],
+          );
+          if (!emptyResult.ok) {
+            pushLog("warn", `[sync] Empty folder register failed ${customerFolder}: ${emptyResult.error}`);
+          }
+          continue;
+        }
+
         const filesWithThumbs = await generateThumbsForFiles(
           files,
           customerPath,
           config.thumbConcurrency || 4,
         );
 
-        // Upload de thumbnails novos ao backend
         for (const file of filesWithThumbs) {
           if (file.thumbnailPath && !file.thumbCached) {
             const uploadResult = await uploadThumbToErp(
@@ -129,14 +179,14 @@ async function runSyncCycle() {
             if (uploadResult.ok) {
               file.thumbnailUrl = uploadResult.thumbnailUrl;
             } else {
-              console.warn(
+              pushLog(
+                "warn",
                 `[thumb] Upload failed for ${file.fileName}: ${uploadResult.error}`,
               );
             }
           }
         }
 
-        // Batch sync para o backend
         const syncPayload = filesWithThumbs.map((f) => ({
           fileName: f.fileName,
           relativePath: f.relativePath,
@@ -151,13 +201,16 @@ async function runSyncCycle() {
           config.apiKey,
           customerFolder,
           root.sourceType,
+          normalizedRoot,
+          isCompleteScan,
           syncPayload,
         );
 
         if (syncResult.ok) {
           const d = syncResult.data;
           if (d.created || d.updated || d.deleted) {
-            console.log(
+            pushLog(
+              "info",
               `[sync] ${customerFolder}: +${d.created} ~${d.updated} -${d.deleted} (${d.total} total)`,
             );
           }
@@ -165,7 +218,8 @@ async function runSyncCycle() {
           totalUpdated += d.updated || 0;
           totalDeleted += d.deleted || 0;
         } else {
-          console.error(
+          pushLog(
+            "error",
             `[sync] FAILED ${customerFolder}: ${syncResult.error}`,
           );
           totalErrors++;
@@ -181,32 +235,185 @@ async function runSyncCycle() {
     state.lastSync = config.lastSync;
     state.lastDurationMs = durationMs;
     state.lastError = totalErrors > 0 ? `${totalErrors} errors` : null;
+    state.discoveredFolders = folders;
 
-    console.log(`\n${"─".repeat(60)}`);
-    console.log(`[sync] Cycle #${cycleNum} DONE in ${(durationMs / 1000).toFixed(1)}s`);
-    console.log(
-      `[sync] customers=${totalCustomers} files=${totalFiles} +${totalCreated} ~${totalUpdated} -${totalDeleted} errors=${totalErrors}`,
+    pushLog(
+      "info",
+      `[sync] Cycle #${cycleNum} DONE in ${(durationMs / 1000).toFixed(1)}s — customers=${totalCustomers} files=${totalFiles} +${totalCreated} ~${totalUpdated} -${totalDeleted} errors=${totalErrors}`,
     );
-    console.log(`${"─".repeat(60)}\n`);
+
+    return {
+      cycle: cycleNum,
+      durationMs,
+      totalCustomers,
+      totalFiles,
+      totalCreated,
+      totalUpdated,
+      totalDeleted,
+      totalErrors,
+    };
   } catch (err) {
-    console.error(`[sync] Cycle #${cycleNum} CRASHED: ${err.message}`);
+    pushLog("error", `[sync] Cycle #${cycleNum} CRASHED: ${err.message}`);
     state.lastError = err.message;
+    return { error: err.message };
   } finally {
     state.running = false;
   }
 }
 
 // ---------------------------------------------------------------------------
-// HTTP (minimal — status only)
+// Restart periodic timer (after config changes)
+// ---------------------------------------------------------------------------
+
+async function restartTimer() {
+  if (syncTimer) clearInterval(syncTimer);
+  const config = await readConfig();
+  const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
+  syncTimer = setInterval(runSyncCycle, intervalMs);
+  pushLog(
+    "info",
+    `[indexer] Timer restarted: ${config.syncIntervalMinutes || 15}min`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HTTP
 // ---------------------------------------------------------------------------
 
 const app = express();
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+// --- Health ---
 
 app.get("/health", (_req, res) => {
+  res.json({ status: "ok", ...state });
+});
+
+// --- API: Status ---
+
+app.get("/api/status", async (_req, res) => {
+  const config = await readConfig();
   res.json({
-    status: "ok",
-    ...state,
+    running: state.running,
+    lastSync: state.lastSync,
+    lastDurationMs: state.lastDurationMs,
+    lastError: state.lastError,
+    cycleCount: state.cycleCount,
+    syncIntervalMinutes: config.syncIntervalMinutes || 15,
+    rootCount: (config.roots || []).length,
+    discoveredFolders: state.discoveredFolders,
   });
+});
+
+// --- API: Logs ---
+
+app.get("/api/logs", (req, res) => {
+  const level = req.query.level;
+  const entries = level
+    ? logBuffer.filter((e) => e.level === level)
+    : logBuffer;
+  res.json(entries.slice(-100));
+});
+
+// --- API: Config ---
+
+app.get("/api/config", async (_req, res) => {
+  const config = await readConfig();
+  res.json({
+    erpApiUrl: config.erpApiUrl || "",
+    syncIntervalMinutes: config.syncIntervalMinutes || 15,
+    thumbConcurrency: config.thumbConcurrency || 4,
+    roots: config.roots || [],
+    lastSync: config.lastSync,
+  });
+});
+
+app.patch("/api/config", async (req, res) => {
+  const config = await readConfig();
+  const allowed = ["erpApiUrl", "apiKey", "syncIntervalMinutes", "thumbConcurrency"];
+
+  for (const key of allowed) {
+    if (req.body[key] !== undefined) {
+      config[key] = req.body[key];
+    }
+  }
+
+  await writeConfig(config);
+  await restartTimer();
+
+  res.json({ ok: true });
+});
+
+// --- API: Roots ---
+
+app.get("/api/roots", async (_req, res) => {
+  const config = await readConfig();
+  const roots = (config.roots || []).map((r, i) => ({ index: i, ...r }));
+  res.json(roots);
+});
+
+app.post("/api/roots", async (req, res) => {
+  const { path: rootPath, sourceType } = req.body;
+  if (!rootPath || !sourceType) {
+    return res.status(400).json({ error: "path and sourceType required" });
+  }
+  if (!["ATACADO", "VAREJO"].includes(sourceType)) {
+    return res.status(400).json({ error: "sourceType must be ATACADO or VAREJO" });
+  }
+
+  const config = await readConfig();
+  config.roots = config.roots || [];
+  config.roots.push({ path: rootPath, sourceType });
+  await writeConfig(config);
+
+  res.json({ ok: true, index: config.roots.length - 1 });
+});
+
+app.put("/api/roots/:index", async (req, res) => {
+  const idx = parseInt(req.params.index, 10);
+  const config = await readConfig();
+
+  if (!config.roots || idx < 0 || idx >= config.roots.length) {
+    return res.status(404).json({ error: "Root not found" });
+  }
+
+  const { path: rootPath, sourceType } = req.body;
+  if (rootPath) config.roots[idx].path = rootPath;
+  if (sourceType) {
+    if (!["ATACADO", "VAREJO"].includes(sourceType)) {
+      return res.status(400).json({ error: "sourceType must be ATACADO or VAREJO" });
+    }
+    config.roots[idx].sourceType = sourceType;
+  }
+
+  await writeConfig(config);
+  res.json({ ok: true });
+});
+
+app.delete("/api/roots/:index", async (req, res) => {
+  const idx = parseInt(req.params.index, 10);
+  const config = await readConfig();
+
+  if (!config.roots || idx < 0 || idx >= config.roots.length) {
+    return res.status(404).json({ error: "Root not found" });
+  }
+
+  config.roots.splice(idx, 1);
+  await writeConfig(config);
+
+  res.json({ ok: true });
+});
+
+// --- API: Manual sync ---
+
+app.post("/api/sync", async (_req, res) => {
+  if (state.running) {
+    return res.status(409).json({ error: "Sync already running" });
+  }
+
+  res.json({ ok: true, message: "Sync started" });
+  runSyncCycle();
 });
 
 // ---------------------------------------------------------------------------
@@ -217,21 +424,27 @@ async function main() {
   const config = await readConfig();
   const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
 
-  console.log("[indexer] Starting DXF File Indexer");
-  console.log(`[indexer] Backend: ${config.erpApiUrl}`);
-  console.log(`[indexer] Roots: ${config.roots.map((r) => `${r.path} (${r.sourceType})`).join(", ")}`);
-  console.log(`[indexer] Sync interval: ${config.syncIntervalMinutes || 15}min`);
-  console.log(`[indexer] Health endpoint: http://localhost:${PORT}/health`);
-  console.log("");
+  pushLog("info", "[indexer] Starting DXF File Indexer");
+  pushLog("info", `[indexer] Backend: ${config.erpApiUrl}`);
+  pushLog(
+    "info",
+    `[indexer] Roots: ${(config.roots || []).map((r) => `${r.path} (${r.sourceType})`).join(", ")}`,
+  );
+  pushLog(
+    "info",
+    `[indexer] Sync interval: ${config.syncIntervalMinutes || 15}min`,
+  );
+  pushLog(
+    "info",
+    `[indexer] GUI: http://localhost:${PORT}`,
+  );
 
-  app.listen(PORT, "127.0.0.1", () => {
-    console.log(`[indexer] HTTP listening on 127.0.0.1:${PORT}`);
+  app.listen(PORT, "0.0.0.0", () => {
+    pushLog("info", `[indexer] HTTP listening on 0.0.0.0:${PORT}`);
   });
 
-  // Primeiro ciclo imediato
   await runSyncCycle();
 
-  // Ciclos periódicos
   syncTimer = setInterval(runSyncCycle, intervalMs);
 }
 

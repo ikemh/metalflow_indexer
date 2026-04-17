@@ -1,18 +1,19 @@
 [Unit]
 Description=DXF File Indexer
-After=network-online.target remote-fs.target
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=indexer
 WorkingDirectory=/opt/indexador
-ExecStartPre=/usr/bin/test -d "/mnt/servidor-ts/Clientes"
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
-RestartSec=60
+RestartSec=30
 StandardOutput=journal
 StandardError=journal
+
+Environment=PORT=4000
 Environment=NODE_ENV=production
 
 [Install]
