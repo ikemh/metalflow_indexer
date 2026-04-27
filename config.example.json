@@ -13,5 +13,10 @@
       "sourceType": "VAREJO"
     }
   ],
+  "excludedFolders": [
+    { "folderName": "antigos" },
+    { "folderName": "temp" },
+    { "folderName": "backup" }
+  ],
   "lastSync": null
 }

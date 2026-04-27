@@ -2,11 +2,13 @@
 """
 DXF → PNG thumbnail (Freedesktop .thumbnailer friendly)
 
-Melhorias em relação à versão original:
+Melhorias:
 - Tenta layouts/paperspace se modelspace não tiver conteúdo visível
 - Gera placeholder branco em vez de falhar com exit != 0 em desenho vazio
 - Erros impressos no stderr para diagnóstico
 - PNG salvo com optimize=True para menor tamanho em disco
+- Escrita ATÔMICA: o PNG final só aparece em OUTPUT após render bem-sucedido
+  (evita arquivos corrompidos parcialmente em caso de falha/kill)
 
 Exit codes:
     0  sucesso (incluindo placeholder para desenho vazio)
@@ -116,6 +118,32 @@ def _pick_layout(doc):
     return best if best is not None else msp
 
 
+def _atomic_save_png(image: Image.Image, out: Path) -> None:
+    """
+    Salva 'image' como PNG em 'out' de forma atômica:
+    1) salva em arquivo temporário no MESMO diretório (rename é atômico)
+    2) os.replace(tmp, out)
+    Garante que 'out' nunca fique parcialmente escrito.
+    """
+    out_dir = out.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".dxfthumb-", suffix=".png", dir=str(out_dir)
+    )
+    os.close(fd)
+
+    try:
+        image.save(tmp_path, "PNG", optimize=True)
+        os.replace(tmp_path, str(out))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         print("Uso: dxf-thumb INPUT size OUTPUT", file=sys.stderr)
@@ -143,7 +171,7 @@ def main() -> int:
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
 
-    tmp_path = None
+    tmp_render_path = None
     try:
         doc    = ezdxf.readfile(inp)
         layout = _pick_layout(doc)
@@ -151,16 +179,16 @@ def main() -> int:
         has_content = _render_layout(doc, layout, ax)
 
         if not has_content:
-            # Desenho sem conteúdo visível: salva placeholder branco
-            Image.new("RGB", (size, size), "white").save(out, "PNG", optimize=True)
+            placeholder = Image.new("RGB", (size, size), "white")
+            _atomic_save_png(placeholder, out)
             return 0
 
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
+            tmp_render_path = tmp.name
 
-        fig.savefig(tmp_path, dpi=dpi, facecolor="white", edgecolor="none")
+        fig.savefig(tmp_render_path, dpi=dpi, facecolor="white", edgecolor="none")
 
-        im = Image.open(tmp_path).convert("RGB")
+        im = Image.open(tmp_render_path).convert("RGB")
         im = _crop_to_content(im)
 
         margin    = max(2, int(size * MARGIN_RATIO))
@@ -168,7 +196,8 @@ def main() -> int:
 
         w, h = im.size
         if w <= 0 or h <= 0:
-            Image.new("RGB", (size, size), "white").save(out, "PNG", optimize=True)
+            placeholder = Image.new("RGB", (size, size), "white")
+            _atomic_save_png(placeholder, out)
             return 0
 
         scale  = max_inner / max(w, h)
@@ -180,18 +209,20 @@ def main() -> int:
         x      = (size - new_w) // 2
         y      = (size - new_h) // 2
         canvas.paste(im, (x, y))
-        canvas.save(out, "PNG", optimize=True)
+
+        _atomic_save_png(canvas, out)
 
         return 0
 
     except Exception as e:
+        # Falha de renderização → erro controlado.
         print(f"Erro ao renderizar {inp.name}: {e}", file=sys.stderr)
         return 3
 
     finally:
-        if tmp_path:
+        if tmp_render_path:
             try:
-                os.unlink(tmp_path)
+                os.unlink(tmp_render_path)
             except OSError:
                 pass
 

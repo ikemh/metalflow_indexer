@@ -70,6 +70,7 @@
       <button class="tab active" data-tab="dashboard">Dashboard</button>
       <button class="tab" data-tab="roots">Roots</button>
       <button class="tab" data-tab="folders">Pastas</button>
+      <button class="tab" data-tab="exclusions">Exceções</button>
       <button class="tab" data-tab="config">Config</button>
       <button class="tab" data-tab="logs">Logs</button>
     </div>
@@ -100,6 +101,10 @@
         <div class="stat">
           <div class="stat-label">Pastas encontradas</div>
           <div class="stat-value" id="folderCount">0</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label">Exceções</div>
+          <div class="stat-value" id="exclusionCount">0</div>
         </div>
       </div>
 
@@ -132,6 +137,27 @@
       <div class="card">
         <h2>Pastas descobertas (último ciclo)</h2>
         <div id="foldersTable"></div>
+      </div>
+    </div>
+
+    <!-- Exclusions -->
+    <div id="tab-exclusions" class="hidden">
+      <div class="card">
+        <h2>Pastas excluídas</h2>
+        <p style="color: var(--muted); font-size: 0.85rem; margin-bottom: 8px;">
+          Pastas com estes nomes serão ignoradas durante a varredura (tanto no nível de clientes quanto em subpastas).
+          Os nomes são normalizados (NFKC, sem espaços extras, minúsculas).
+        </p>
+        <p style="color: var(--yellow); font-size: 0.85rem; margin-bottom: 16px;">
+          Aviso: arquivos que estiverem dentro de pastas excluídas podem deixar de aparecer no ERP após o próximo sync completo, pois passam a ser tratados como inexistentes pela varredura.
+        </p>
+        <div id="exclusionsList"></div>
+
+        <h2 style="margin-top:16px">Adicionar exclusão</h2>
+        <div class="form-row">
+          <input type="text" id="newExclusion" placeholder="Nome da pasta (ex: antigos, temp, backup)">
+          <button class="btn-primary btn-sm" onclick="addExclusion()">Adicionar</button>
+        </div>
       </div>
     </div>
 
@@ -195,40 +221,52 @@ document.querySelectorAll('.tab').forEach(t => {
     if (id === 'roots') loadRoots();
     if (id === 'config') loadConfig();
     if (id === 'folders') loadFolders();
+    if (id === 'exclusions') loadExclusions();
   });
 });
 
 // --- Status polling ---
 async function loadStatus() {
+  // Status principal — se falhar, GUI não trava no resto.
   try {
     const r = await fetch(API + '/api/status');
-    const d = await r.json();
+    if (r.ok) {
+      const d = await r.json();
+      const badge = document.getElementById('statusBadge');
+      const statusEl = document.getElementById('syncStatus');
 
-    const badge = document.getElementById('statusBadge');
-    const statusEl = document.getElementById('syncStatus');
+      if (d.running) {
+        badge.textContent = 'Sincronizando';
+        badge.className = 'badge badge-yellow';
+        statusEl.textContent = 'Em execução';
+      } else if (d.lastError) {
+        badge.textContent = 'Erro';
+        badge.className = 'badge badge-red';
+        statusEl.textContent = 'Erro';
+      } else {
+        badge.textContent = 'OK';
+        badge.className = 'badge badge-green';
+        statusEl.textContent = 'Ocioso';
+      }
 
-    if (d.running) {
-      badge.textContent = 'Sincronizando';
-      badge.className = 'badge badge-yellow';
-      statusEl.textContent = 'Em execução';
-    } else if (d.lastError) {
-      badge.textContent = 'Erro';
-      badge.className = 'badge badge-red';
-      statusEl.textContent = 'Erro';
-    } else {
-      badge.textContent = 'OK';
-      badge.className = 'badge badge-green';
-      statusEl.textContent = 'Ocioso';
+      document.getElementById('lastSync').textContent = d.lastSync ? fmtDate(d.lastSync) : '—';
+      document.getElementById('lastDuration').textContent = d.lastDurationMs ? (d.lastDurationMs / 1000).toFixed(1) + 's' : '—';
+      document.getElementById('cycleCount').textContent = d.cycleCount;
+      document.getElementById('rootCount').textContent = d.rootCount;
+      document.getElementById('folderCount').textContent = (d.discoveredFolders || []).length;
+      document.getElementById('lastError').textContent = d.lastError || '';
+      document.getElementById('btnSync').disabled = d.running;
     }
+  } catch {}
 
-    document.getElementById('lastSync').textContent = d.lastSync ? fmtDate(d.lastSync) : '—';
-    document.getElementById('lastDuration').textContent = d.lastDurationMs ? (d.lastDurationMs / 1000).toFixed(1) + 's' : '—';
-    document.getElementById('cycleCount').textContent = d.cycleCount;
-    document.getElementById('rootCount').textContent = d.rootCount;
-    document.getElementById('folderCount').textContent = (d.discoveredFolders || []).length;
-    document.getElementById('lastError').textContent = d.lastError || '';
-
-    document.getElementById('btnSync').disabled = d.running;
+  // Contador de exclusões — fetch independente; se falhar, GUI não quebra.
+  try {
+    const r = await fetch(API + '/api/exclusions');
+    if (r.ok) {
+      const exclusions = await r.json();
+      const cell = document.getElementById('exclusionCount');
+      if (cell) cell.textContent = exclusions.length;
+    }
   } catch {}
 }
 
@@ -370,6 +408,79 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// --- Exclusions ---
+async function loadExclusions() {
+  let exclusions = [];
+  try {
+    const r = await fetch(API + '/api/exclusions');
+    if (r.ok) {
+      exclusions = await r.json();
+    }
+  } catch {}
+
+  const el = document.getElementById('exclusionsList');
+  if (el) {
+    if (exclusions.length === 0) {
+      el.innerHTML = '<div class="empty">Nenhuma pasta excluída</div>';
+    } else {
+      el.innerHTML = '<table><thead><tr><th>#</th><th>Nome da pasta</th><th></th></tr></thead><tbody>' +
+        exclusions.map(e => `<tr>
+          <td>${e.index}</td>
+          <td style="word-break:break-all"><span class="badge badge-red">${esc(e.folderName)}</span></td>
+          <td><button class="btn-danger btn-sm" onclick="removeExclusion(${e.index})">Remover</button></td>
+        </tr>`).join('') +
+        '</tbody></table>';
+    }
+  }
+
+  // Mantém contador sincronizado com a lista exibida.
+  const counter = document.getElementById('exclusionCount');
+  if (counter) counter.textContent = exclusions.length;
+}
+
+async function addExclusion() {
+  const input = document.getElementById('newExclusion');
+  const folderName = (input?.value || '').trim();
+  if (!folderName) return;
+
+  try {
+    const r = await fetch(API + '/api/exclusions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folderName }),
+    });
+
+    if (!r.ok) {
+      let msg = 'Falha ao adicionar exclusão';
+      try { msg = (await r.json()).error || msg; } catch {}
+      alert('Erro: ' + msg);
+      return;
+    }
+
+    if (input) input.value = '';
+    await loadExclusions();
+  } catch (err) {
+    alert('Erro de conexão: ' + err.message);
+  }
+}
+
+async function removeExclusion(idx) {
+  if (!confirm('Remover esta exclusão?')) return;
+  try {
+    const r = await fetch(API + '/api/exclusions/' + idx, { method: 'DELETE' });
+    if (!r.ok) {
+      let msg = 'Falha ao remover exclusão';
+      try { msg = (await r.json()).error || msg; } catch {}
+      alert('Erro: ' + msg);
+      return;
+    }
+  } catch (err) {
+    alert('Erro de conexão: ' + err.message);
+    return;
+  }
+  await loadExclusions();
 }
 
 // --- Init ---

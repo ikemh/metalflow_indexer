@@ -2,12 +2,17 @@
 
 const express = require("express");
 const path = require("path");
-const { readConfig, writeConfig } = require("./lib/config");
+const {
+  readConfig,
+  writeConfig,
+  normalizeExclusionName,
+} = require("./lib/config");
 const {
   discoverCustomers,
   scanFolder,
   isRootAccessible,
   normalizeRootPath,
+  clearExcludedFoldersCache,
 } = require("./lib/scanner");
 const {
   checkBackendHealth,
@@ -45,6 +50,23 @@ function pushLog(level, message) {
 }
 
 let syncTimer = null;
+
+/**
+ * Valida e satura `thumbConcurrency` da config:
+ *   - converte para número (descarta strings/NaN)
+ *   - default 4 se ausente/null/string vazia/NaN
+ *   - clamp para [1, 8] (0 ou negativo viram 1; > 8 viram 8)
+ *   - aplicado ANTES de criar workers em thumbgen
+ */
+function clampThumbConcurrency(raw) {
+  if (raw === null || raw === undefined || raw === "") return 4;
+  let n = Number(raw);
+  if (!Number.isFinite(n) || Number.isNaN(n)) return 4;
+  n = Math.floor(n);
+  if (n < 1) n = 1;
+  if (n > 8) n = 8;
+  return n;
+}
 
 // ---------------------------------------------------------------------------
 // Sync cycle
@@ -162,11 +184,28 @@ async function runSyncCycle() {
           continue;
         }
 
-        const filesWithThumbs = await generateThumbsForFiles(
-          files,
-          customerPath,
-          config.thumbConcurrency || 4,
-        );
+        const thumbResult = await generateThumbsForFiles(files, customerPath, {
+          concurrency: clampThumbConcurrency(config.thumbConcurrency),
+          customerLabel: customerFolder,
+        });
+        const filesWithThumbs = thumbResult.files;
+        const thumbStats = thumbResult.stats;
+
+        // Resumo por cliente é só para casos com algum evento relevante.
+        // Se foi tudo cache (ou nada), o terminal fica limpo.
+        const hasThumbEvents =
+          thumbStats.ok > 0 ||
+          thumbStats.failed > 0 ||
+          thumbStats.timeout > 0 ||
+          thumbStats.missing > 0 ||
+          thumbStats.locked > 0;
+
+        if (hasThumbEvents) {
+          pushLog(
+            "info",
+            `[thumb] ${customerFolder}: ok=${thumbStats.ok} cached=${thumbStats.cached} failed=${thumbStats.failed} timeout=${thumbStats.timeout} missing=${thumbStats.missing} locked=${thumbStats.locked}`,
+          );
+        }
 
         for (const file of filesWithThumbs) {
           if (file.thumbnailPath && !file.thumbCached) {
@@ -187,6 +226,8 @@ async function runSyncCycle() {
           }
         }
 
+        // IMPORTANTE: payload do backend NUNCA inclui `absolutePath`.
+        // Esse campo é apenas interno (usado pelo gerador de thumbs).
         const syncPayload = filesWithThumbs.map((f) => ({
           fileName: f.fileName,
           relativePath: f.relativePath,
@@ -402,6 +443,93 @@ app.delete("/api/roots/:index", async (req, res) => {
   config.roots.splice(idx, 1);
   await writeConfig(config);
 
+  res.json({ ok: true });
+});
+
+// --- API: Excluded Folders ---
+
+app.get("/api/exclusions", async (_req, res) => {
+  try {
+    const config = await readConfig();
+    const exclusions = (config.excludedFolders || []).map((e, i) => ({
+      index: i,
+      ...e,
+    }));
+    res.json(exclusions);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/exclusions", async (req, res) => {
+  const raw = req.body && req.body.folderName;
+  const normalized = normalizeExclusionName(raw);
+
+  if (!normalized) {
+    return res.status(400).json({
+      error:
+        "folderName inválido (vazio, '.', '..', ou contém '/' ou '\\').",
+    });
+  }
+
+  const config = await readConfig();
+  const list = Array.isArray(config.excludedFolders)
+    ? config.excludedFolders
+    : [];
+
+  // Duplicata: comparar pela forma normalizada (NFKC + trim + lowercase),
+  // de modo que "Antigos", "antigos " e "ANTIGOS" sejam todos a mesma exclusão.
+  const duplicate = list.some(
+    (e) => normalizeExclusionName(e?.folderName) === normalized,
+  );
+  if (duplicate) {
+    return res.status(409).json({ error: "Pasta já está excluída." });
+  }
+
+  list.push({ folderName: normalized });
+  config.excludedFolders = list;
+
+  try {
+    await writeConfig(config);
+  } catch (err) {
+    return res.status(500).json({ error: `Falha ao salvar config: ${err.message}` });
+  }
+
+  // Invalida cache do scanner imediatamente.
+  clearExcludedFoldersCache();
+
+  pushLog("info", `[config] Exclusion added: ${normalized}`);
+  res.json({ ok: true, index: list.length - 1, folderName: normalized });
+});
+
+app.delete("/api/exclusions/:index", async (req, res) => {
+  const idx = parseInt(req.params.index, 10);
+  const config = await readConfig();
+
+  if (
+    !Array.isArray(config.excludedFolders) ||
+    Number.isNaN(idx) ||
+    idx < 0 ||
+    idx >= config.excludedFolders.length
+  ) {
+    return res.status(404).json({ error: "Exclusion not found" });
+  }
+
+  const removed = config.excludedFolders[idx];
+  config.excludedFolders.splice(idx, 1);
+
+  try {
+    await writeConfig(config);
+  } catch (err) {
+    return res.status(500).json({ error: `Falha ao salvar config: ${err.message}` });
+  }
+
+  clearExcludedFoldersCache();
+
+  pushLog(
+    "info",
+    `[config] Exclusion removed: ${removed?.folderName ?? ""}`.trim(),
+  );
   res.json({ ok: true });
 });
 
