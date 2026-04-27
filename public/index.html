@@ -181,6 +181,20 @@
           <label style="width:160px;flex-shrink:0;font-size:0.85rem">Thumb concurrency</label>
           <input type="number" id="cfgThumbConc" min="1" max="16">
         </div>
+        <div class="form-row" style="align-items:center">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Watcher (chokidar)</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem">
+            <input type="checkbox" id="cfgWatchEnabled">
+            Ativar
+          </label>
+          <span style="margin-left:12px;font-size:0.78rem;color:var(--muted, #888)">
+            Recomendado apenas em produção Windows com disco local. Não use em Fedora + SMB + Tailscale.
+          </span>
+        </div>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Watch debounce (s)</label>
+          <input type="number" id="cfgWatchDebounce" min="5" max="120">
+        </div>
         <div style="margin-top:12px">
           <button class="btn-primary" onclick="saveConfig()">Salvar configurações</button>
           <span id="cfgSaveMsg" style="margin-left:8px;font-size:0.8rem;color:var(--green)"></span>
@@ -356,6 +370,8 @@ async function loadConfig() {
   document.getElementById('cfgErpUrl').value = c.erpApiUrl || '';
   document.getElementById('cfgInterval').value = c.syncIntervalMinutes || 15;
   document.getElementById('cfgThumbConc').value = c.thumbConcurrency || 4;
+  document.getElementById('cfgWatchEnabled').checked = c.watchEnabled === true;
+  document.getElementById('cfgWatchDebounce').value = c.watchDebounceSeconds || 15;
   document.getElementById('cfgApiKey').value = '';
   document.getElementById('cfgSaveMsg').textContent = '';
 }
@@ -366,11 +382,17 @@ async function saveConfig() {
   const key = document.getElementById('cfgApiKey').value.trim();
   const interval = parseInt(document.getElementById('cfgInterval').value, 10);
   const conc = parseInt(document.getElementById('cfgThumbConc').value, 10);
+  const watchEnabled = document.getElementById('cfgWatchEnabled').checked;
+  const watchDebounce = parseInt(document.getElementById('cfgWatchDebounce').value, 10);
 
   if (url) body.erpApiUrl = url;
   if (key) body.apiKey = key;
   if (interval > 0) body.syncIntervalMinutes = interval;
   if (conc > 0) body.thumbConcurrency = conc;
+  body.watchEnabled = !!watchEnabled;
+  if (Number.isFinite(watchDebounce) && watchDebounce > 0) {
+    body.watchDebounceSeconds = watchDebounce;
+  }
 
   await fetch(API + '/api/config', {
     method: 'PATCH',

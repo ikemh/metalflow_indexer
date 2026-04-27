@@ -6,6 +6,8 @@ const {
   readConfig,
   writeConfig,
   normalizeExclusionName,
+  coerceWatchEnabled,
+  clampWatchDebounceSeconds,
 } = require("./lib/config");
 const {
   discoverCustomers,
@@ -20,6 +22,7 @@ const {
   batchSyncToErp,
 } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
+const { createWatcher } = require("./lib/watcher");
 
 const PORT = process.env.PORT || 4000;
 
@@ -50,6 +53,28 @@ function pushLog(level, message) {
 }
 
 let syncTimer = null;
+let watcherInstance = null;
+
+/**
+ * Fila serializada para evitar concorrência entre o sync periódico e o
+ * sync parcial vindo do watcher. Tudo passa por aqui em ordem FIFO.
+ *
+ * Garante:
+ *   - dois `runSyncCycle` nunca rodam em paralelo
+ *   - sync parcial do watcher nunca cruza com sync completo do timer
+ *   - dois eventos para o mesmo cliente (após debounce) são executados
+ *     sequencialmente (e o segundo encontra o estado já consolidado)
+ */
+let syncQueue = Promise.resolve();
+function enqueueSync(label, fn) {
+  syncQueue = syncQueue
+    .catch(() => {})
+    .then(() => fn())
+    .catch((err) => {
+      pushLog("error", `[queue] ${label} crashed: ${err.message}`);
+    });
+  return syncQueue;
+}
 
 /**
  * Valida e satura `thumbConcurrency` da config:
@@ -69,7 +94,158 @@ function clampThumbConcurrency(raw) {
 }
 
 // ---------------------------------------------------------------------------
-// Sync cycle
+// Sync — função reutilizável por cliente
+// ---------------------------------------------------------------------------
+
+/**
+ * Sincroniza UMA pasta de cliente (root + customerFolder) com o backend ERP.
+ *
+ * Reutilizada por:
+ *   - runSyncCycle() — itera todos os clientes de todos os roots;
+ *   - watcher       — sincroniza apenas o cliente afetado por um evento.
+ *
+ * Retorna estatísticas para o caller agregar.
+ *
+ * Atenção: NÃO toca em state.running. A serialização entre chamadas é
+ * responsabilidade do caller (via enqueueSync).
+ */
+async function syncCustomerFolder(config, root, customerFolder, options = {}) {
+  const { source = "cycle" } = options;
+  const normalizedRoot = normalizeRootPath(root.path);
+  const customerPath = path.join(root.path, customerFolder);
+
+  const result = {
+    customerFolder,
+    sourceType: root.sourceType,
+    rootPath: normalizedRoot,
+    fileCount: 0,
+    isCompleteScan: false,
+    created: 0,
+    updated: 0,
+    deleted: 0,
+    error: null,
+    source,
+  };
+
+  const { files, warnings } = await scanFolder(
+    customerPath,
+    root.sourceType,
+    customerFolder,
+  );
+
+  const hasWarnings = warnings.length > 0;
+  if (hasWarnings) {
+    for (const w of warnings) {
+      pushLog("warn", `[scan] ${w.type}: ${w.message}`);
+    }
+  }
+
+  const isCompleteScan = !hasWarnings;
+  result.isCompleteScan = isCompleteScan;
+  result.fileCount = files.length;
+
+  if (files.length === 0) {
+    const emptyResult = await batchSyncToErp(
+      config.erpApiUrl,
+      config.apiKey,
+      customerFolder,
+      root.sourceType,
+      normalizedRoot,
+      isCompleteScan,
+      [],
+    );
+    if (!emptyResult.ok) {
+      pushLog(
+        "warn",
+        `[sync] Empty folder register failed ${customerFolder}: ${emptyResult.error}`,
+      );
+      result.error = emptyResult.error;
+    }
+    return result;
+  }
+
+  const thumbResult = await generateThumbsForFiles(files, customerPath, {
+    concurrency: clampThumbConcurrency(config.thumbConcurrency),
+    customerLabel: customerFolder,
+  });
+  const filesWithThumbs = thumbResult.files;
+  const thumbStats = thumbResult.stats;
+
+  const hasThumbEvents =
+    thumbStats.ok > 0 ||
+    thumbStats.failed > 0 ||
+    thumbStats.timeout > 0 ||
+    thumbStats.missing > 0 ||
+    thumbStats.locked > 0;
+
+  if (hasThumbEvents) {
+    pushLog(
+      "info",
+      `[thumb] ${customerFolder}: ok=${thumbStats.ok} cached=${thumbStats.cached} failed=${thumbStats.failed} timeout=${thumbStats.timeout} missing=${thumbStats.missing} locked=${thumbStats.locked}`,
+    );
+  }
+
+  for (const file of filesWithThumbs) {
+    if (file.thumbnailPath && !file.thumbCached) {
+      const uploadResult = await uploadThumbToErp(
+        config.erpApiUrl,
+        config.apiKey,
+        file.id,
+        file.thumbnailPath,
+      );
+      if (uploadResult.ok) {
+        file.thumbnailUrl = uploadResult.thumbnailUrl;
+      } else {
+        pushLog(
+          "warn",
+          `[thumb] Upload failed for ${file.fileName}: ${uploadResult.error}`,
+        );
+      }
+    }
+  }
+
+  // IMPORTANTE: payload do backend NUNCA inclui `absolutePath`.
+  // Esse campo é apenas interno (usado pelo gerador de thumbs).
+  const syncPayload = filesWithThumbs.map((f) => ({
+    fileName: f.fileName,
+    relativePath: f.relativePath,
+    extension: f.extension,
+    sizeBytes: f.sizeBytes,
+    lastModifiedAt: f.lastModifiedAt,
+    thumbnailUrl: f.thumbnailUrl || null,
+  }));
+
+  const syncResult = await batchSyncToErp(
+    config.erpApiUrl,
+    config.apiKey,
+    customerFolder,
+    root.sourceType,
+    normalizedRoot,
+    isCompleteScan,
+    syncPayload,
+  );
+
+  if (syncResult.ok) {
+    const d = syncResult.data || {};
+    if (d.created || d.updated || d.deleted) {
+      pushLog(
+        "info",
+        `[sync] ${customerFolder}: +${d.created || 0} ~${d.updated || 0} -${d.deleted || 0} (${d.total || 0} total)`,
+      );
+    }
+    result.created = d.created || 0;
+    result.updated = d.updated || 0;
+    result.deleted = d.deleted || 0;
+  } else {
+    pushLog("error", `[sync] FAILED ${customerFolder}: ${syncResult.error}`);
+    result.error = syncResult.error;
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Sync cycle (varredura completa)
 // ---------------------------------------------------------------------------
 
 async function runSyncCycle() {
@@ -139,132 +315,25 @@ async function runSyncCycle() {
       pushLog("info", `[root] Found ${customers.length} customer folders`);
 
       for (const customerFolder of customers) {
-        const customerPath = path.join(root.path, customerFolder);
-
-        const { files, warnings } = await scanFolder(
-          customerPath,
-          root.sourceType,
-          customerFolder,
-        );
-
-        const hasWarnings = warnings.length > 0;
-        if (hasWarnings) {
-          for (const w of warnings) {
-            pushLog("warn", `[scan] ${w.type}: ${w.message}`);
-          }
-        }
-
-        const isCompleteScan = !hasWarnings;
+        const r = await syncCustomerFolder(config, root, customerFolder, {
+          source: "cycle",
+        });
 
         folders.push({
-          folderName: customerFolder,
-          sourceType: root.sourceType,
+          folderName: r.customerFolder,
+          sourceType: r.sourceType,
           rootPath: normalizedRoot,
-          fileCount: files.length,
-          isCompleteScan,
+          fileCount: r.fileCount,
+          isCompleteScan: r.isCompleteScan,
           lastSeenAt: new Date().toISOString(),
         });
 
         totalCustomers++;
-        totalFiles += files.length;
-
-        if (files.length === 0) {
-          const emptyResult = await batchSyncToErp(
-            config.erpApiUrl,
-            config.apiKey,
-            customerFolder,
-            root.sourceType,
-            normalizedRoot,
-            isCompleteScan,
-            [],
-          );
-          if (!emptyResult.ok) {
-            pushLog("warn", `[sync] Empty folder register failed ${customerFolder}: ${emptyResult.error}`);
-          }
-          continue;
-        }
-
-        const thumbResult = await generateThumbsForFiles(files, customerPath, {
-          concurrency: clampThumbConcurrency(config.thumbConcurrency),
-          customerLabel: customerFolder,
-        });
-        const filesWithThumbs = thumbResult.files;
-        const thumbStats = thumbResult.stats;
-
-        // Resumo por cliente é só para casos com algum evento relevante.
-        // Se foi tudo cache (ou nada), o terminal fica limpo.
-        const hasThumbEvents =
-          thumbStats.ok > 0 ||
-          thumbStats.failed > 0 ||
-          thumbStats.timeout > 0 ||
-          thumbStats.missing > 0 ||
-          thumbStats.locked > 0;
-
-        if (hasThumbEvents) {
-          pushLog(
-            "info",
-            `[thumb] ${customerFolder}: ok=${thumbStats.ok} cached=${thumbStats.cached} failed=${thumbStats.failed} timeout=${thumbStats.timeout} missing=${thumbStats.missing} locked=${thumbStats.locked}`,
-          );
-        }
-
-        for (const file of filesWithThumbs) {
-          if (file.thumbnailPath && !file.thumbCached) {
-            const uploadResult = await uploadThumbToErp(
-              config.erpApiUrl,
-              config.apiKey,
-              file.id,
-              file.thumbnailPath,
-            );
-            if (uploadResult.ok) {
-              file.thumbnailUrl = uploadResult.thumbnailUrl;
-            } else {
-              pushLog(
-                "warn",
-                `[thumb] Upload failed for ${file.fileName}: ${uploadResult.error}`,
-              );
-            }
-          }
-        }
-
-        // IMPORTANTE: payload do backend NUNCA inclui `absolutePath`.
-        // Esse campo é apenas interno (usado pelo gerador de thumbs).
-        const syncPayload = filesWithThumbs.map((f) => ({
-          fileName: f.fileName,
-          relativePath: f.relativePath,
-          extension: f.extension,
-          sizeBytes: f.sizeBytes,
-          lastModifiedAt: f.lastModifiedAt,
-          thumbnailUrl: f.thumbnailUrl || null,
-        }));
-
-        const syncResult = await batchSyncToErp(
-          config.erpApiUrl,
-          config.apiKey,
-          customerFolder,
-          root.sourceType,
-          normalizedRoot,
-          isCompleteScan,
-          syncPayload,
-        );
-
-        if (syncResult.ok) {
-          const d = syncResult.data;
-          if (d.created || d.updated || d.deleted) {
-            pushLog(
-              "info",
-              `[sync] ${customerFolder}: +${d.created} ~${d.updated} -${d.deleted} (${d.total} total)`,
-            );
-          }
-          totalCreated += d.created || 0;
-          totalUpdated += d.updated || 0;
-          totalDeleted += d.deleted || 0;
-        } else {
-          pushLog(
-            "error",
-            `[sync] FAILED ${customerFolder}: ${syncResult.error}`,
-          );
-          totalErrors++;
-        }
+        totalFiles += r.fileCount;
+        totalCreated += r.created;
+        totalUpdated += r.updated;
+        totalDeleted += r.deleted;
+        if (r.error) totalErrors++;
       }
     }
 
@@ -302,19 +371,111 @@ async function runSyncCycle() {
   }
 }
 
+/**
+ * Sincroniza um único cliente em resposta a evento do watcher.
+ * Sempre passa pela `enqueueSync` para nunca cruzar com runSyncCycle.
+ *
+ * Não usa state.running diretamente — a fila já garante exclusão mútua.
+ */
+async function syncSingleCustomer(root, customerFolder) {
+  const config = await readConfig();
+  if (!config.erpApiUrl || !config.apiKey) {
+    pushLog(
+      "warn",
+      `[watch] missing erpApiUrl/apiKey, skipping ${customerFolder}`,
+    );
+    return;
+  }
+
+  const accessible = await isRootAccessible(root.path);
+  if (!accessible) {
+    pushLog(
+      "warn",
+      `[watch] root inaccessible (${root.path}), skipping ${customerFolder}`,
+    );
+    return;
+  }
+
+  const healthy = await checkBackendHealth(config.erpApiUrl);
+  if (!healthy) {
+    pushLog(
+      "warn",
+      `[watch] backend unreachable, skipping ${customerFolder}`,
+    );
+    return;
+  }
+
+  await syncCustomerFolder(config, root, customerFolder, { source: "watch" });
+}
+
 // ---------------------------------------------------------------------------
 // Restart periodic timer (after config changes)
 // ---------------------------------------------------------------------------
+
+function scheduleCycle() {
+  enqueueSync("cycle", () => runSyncCycle());
+}
 
 async function restartTimer() {
   if (syncTimer) clearInterval(syncTimer);
   const config = await readConfig();
   const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
-  syncTimer = setInterval(runSyncCycle, intervalMs);
+  syncTimer = setInterval(scheduleCycle, intervalMs);
   pushLog(
     "info",
     `[indexer] Timer restarted: ${config.syncIntervalMinutes || 15}min`,
   );
+}
+
+// ---------------------------------------------------------------------------
+// Watcher lifecycle
+// ---------------------------------------------------------------------------
+
+/**
+ * (Re)inicia o watcher conforme config atual.
+ *
+ * Chamado:
+ *   - no startup, após carregar a config;
+ *   - após PATCH /api/config se watchEnabled/watchDebounceSeconds mudarem;
+ *   - após mutações em /api/roots ou /api/exclusions (para refletir
+ *     mudança na lista de pastas observadas).
+ *
+ * Política:
+ *   - se watchEnabled === false, fecha watcher anterior (se existir) e
+ *     loga `[watch] disabled`.
+ *   - se watchEnabled === true e há pelo menos 1 root, cria/recria o
+ *     watcher e loga `[watch] enabled: roots=N debounce=Xs`.
+ */
+async function applyWatcherConfig() {
+  if (watcherInstance) {
+    try {
+      await watcherInstance.close();
+    } catch (err) {
+      pushLog("warn", `[watch] close error: ${err.message}`);
+    }
+    watcherInstance = null;
+  }
+
+  const config = await readConfig();
+
+  if (!coerceWatchEnabled(config.watchEnabled)) {
+    pushLog("info", "[watch] disabled");
+    return;
+  }
+
+  watcherInstance = createWatcher({
+    config,
+    log: pushLog,
+    onCustomerChanged: ({ root, customerFolder }) => {
+      // Enfileira: nunca roda sync parcial em paralelo com sync completo
+      // ou com outro sync parcial.
+      enqueueSync(`watch:${customerFolder}`, () =>
+        syncSingleCustomer(root, customerFolder),
+      );
+    },
+  });
+
+  watcherInstance.start();
 }
 
 // ---------------------------------------------------------------------------
@@ -365,6 +526,8 @@ app.get("/api/config", async (_req, res) => {
     erpApiUrl: config.erpApiUrl || "",
     syncIntervalMinutes: config.syncIntervalMinutes || 15,
     thumbConcurrency: config.thumbConcurrency || 4,
+    watchEnabled: coerceWatchEnabled(config.watchEnabled),
+    watchDebounceSeconds: clampWatchDebounceSeconds(config.watchDebounceSeconds),
     roots: config.roots || [],
     lastSync: config.lastSync,
   });
@@ -372,16 +535,49 @@ app.get("/api/config", async (_req, res) => {
 
 app.patch("/api/config", async (req, res) => {
   const config = await readConfig();
-  const allowed = ["erpApiUrl", "apiKey", "syncIntervalMinutes", "thumbConcurrency"];
+  const allowed = [
+    "erpApiUrl",
+    "apiKey",
+    "syncIntervalMinutes",
+    "thumbConcurrency",
+    "watchEnabled",
+    "watchDebounceSeconds",
+  ];
+
+  // Snapshot para detectar mudanças relevantes ao watcher.
+  const prevWatchEnabled = coerceWatchEnabled(config.watchEnabled);
+  const prevWatchDebounce = clampWatchDebounceSeconds(
+    config.watchDebounceSeconds,
+  );
 
   for (const key of allowed) {
     if (req.body[key] !== undefined) {
-      config[key] = req.body[key];
+      if (key === "watchEnabled") {
+        config.watchEnabled = coerceWatchEnabled(req.body.watchEnabled);
+      } else if (key === "watchDebounceSeconds") {
+        config.watchDebounceSeconds = clampWatchDebounceSeconds(
+          req.body.watchDebounceSeconds,
+        );
+      } else {
+        config[key] = req.body[key];
+      }
     }
   }
 
   await writeConfig(config);
   await restartTimer();
+
+  const newWatchEnabled = coerceWatchEnabled(config.watchEnabled);
+  const newWatchDebounce = clampWatchDebounceSeconds(
+    config.watchDebounceSeconds,
+  );
+
+  if (
+    newWatchEnabled !== prevWatchEnabled ||
+    newWatchDebounce !== prevWatchDebounce
+  ) {
+    await applyWatcherConfig();
+  }
 
   res.json({ ok: true });
 });
@@ -408,6 +604,8 @@ app.post("/api/roots", async (req, res) => {
   config.roots.push({ path: rootPath, sourceType });
   await writeConfig(config);
 
+  if (coerceWatchEnabled(config.watchEnabled)) await applyWatcherConfig();
+
   res.json({ ok: true, index: config.roots.length - 1 });
 });
 
@@ -429,6 +627,9 @@ app.put("/api/roots/:index", async (req, res) => {
   }
 
   await writeConfig(config);
+
+  if (coerceWatchEnabled(config.watchEnabled)) await applyWatcherConfig();
+
   res.json({ ok: true });
 });
 
@@ -442,6 +643,8 @@ app.delete("/api/roots/:index", async (req, res) => {
 
   config.roots.splice(idx, 1);
   await writeConfig(config);
+
+  if (coerceWatchEnabled(config.watchEnabled)) await applyWatcherConfig();
 
   res.json({ ok: true });
 });
@@ -499,6 +702,9 @@ app.post("/api/exclusions", async (req, res) => {
   clearExcludedFoldersCache();
 
   pushLog("info", `[config] Exclusion added: ${normalized}`);
+
+  if (coerceWatchEnabled(config.watchEnabled)) await applyWatcherConfig();
+
   res.json({ ok: true, index: list.length - 1, folderName: normalized });
 });
 
@@ -530,6 +736,9 @@ app.delete("/api/exclusions/:index", async (req, res) => {
     "info",
     `[config] Exclusion removed: ${removed?.folderName ?? ""}`.trim(),
   );
+
+  if (coerceWatchEnabled(config.watchEnabled)) await applyWatcherConfig();
+
   res.json({ ok: true });
 });
 
@@ -541,7 +750,8 @@ app.post("/api/sync", async (_req, res) => {
   }
 
   res.json({ ok: true, message: "Sync started" });
-  runSyncCycle();
+  // Passa pela fila para nunca cruzar com sync parcial do watcher.
+  scheduleCycle();
 });
 
 // ---------------------------------------------------------------------------
@@ -571,18 +781,34 @@ async function main() {
     pushLog("info", `[indexer] HTTP listening on 0.0.0.0:${PORT}`);
   });
 
-  await runSyncCycle();
+  // Watcher é opcional. O sync periódico continua sendo a fonte de verdade
+  // — o watcher apenas reduz latência em produção Windows com disco local.
+  // No ambiente local (Fedora + SMB + Tailscale), watchEnabled deve ficar false.
+  await applyWatcherConfig();
 
-  syncTimer = setInterval(runSyncCycle, intervalMs);
+  // Primeiro ciclo + agendamento periódico, ambos passando pela fila.
+  scheduleCycle();
+  syncTimer = setInterval(scheduleCycle, intervalMs);
 }
 
 // ---------------------------------------------------------------------------
 // Signal handling
 // ---------------------------------------------------------------------------
 
-function shutdown(signal) {
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`\n[indexer] ${signal} received, shutting down...`);
   if (syncTimer) clearInterval(syncTimer);
+  if (watcherInstance) {
+    try {
+      await watcherInstance.close();
+    } catch (err) {
+      console.error(`[indexer] watcher close error: ${err.message}`);
+    }
+    watcherInstance = null;
+  }
   process.exit(0);
 }
 

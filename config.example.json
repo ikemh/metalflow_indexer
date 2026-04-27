@@ -18,5 +18,7 @@
     { "folderName": "temp" },
     { "folderName": "backup" }
   ],
+  "watchEnabled": false,
+  "watchDebounceSeconds": 15,
   "lastSync": null
 }
