@@ -145,16 +145,20 @@
       <div class="card">
         <h2>Pastas excluídas</h2>
         <p style="color: var(--muted); font-size: 0.85rem; margin-bottom: 8px;">
-          Pastas com estes nomes serão ignoradas durante a varredura (tanto no nível de clientes quanto em subpastas).
-          Os nomes são normalizados (NFKC, sem espaços extras, minúsculas).
+          Pastas excluídas são ignoradas apenas no primeiro nível do root selecionado. Subpastas internas de outras pastas continuam sendo varridas normalmente.
+          A comparação é normalizada (NFKC, trim, minúsculas).
         </p>
         <p style="color: var(--yellow); font-size: 0.85rem; margin-bottom: 16px;">
-          Aviso: arquivos que estiverem dentro de pastas excluídas podem deixar de aparecer no ERP após o próximo sync completo, pois passam a ser tratados como inexistentes pela varredura.
+          Arquivos dentro da pasta de primeiro nível excluída podem deixar de aparecer/atualizar no ERP enquanto a regra estiver ativa. Arquivos físicos não são apagados.
         </p>
         <div id="exclusionsList"></div>
 
         <h2 style="margin-top:16px">Adicionar exclusão</h2>
         <div class="form-row">
+          <select id="newExclusionType" style="max-width: 140px">
+            <option value="ATACADO">ATACADO</option>
+            <option value="VAREJO">VAREJO</option>
+          </select>
           <input type="text" id="newExclusion" placeholder="Nome da pasta (ex: antigos, temp, backup)">
           <button class="btn-primary btn-sm" onclick="addExclusion()">Adicionar</button>
         </div>
@@ -447,9 +451,12 @@ async function loadExclusions() {
     if (exclusions.length === 0) {
       el.innerHTML = '<div class="empty">Nenhuma pasta excluída</div>';
     } else {
-      el.innerHTML = '<table><thead><tr><th>#</th><th>Nome da pasta</th><th></th></tr></thead><tbody>' +
+      el.innerHTML = '<table><thead><tr><th>#</th><th>Tipo</th><th>Nome da pasta</th><th></th></tr></thead><tbody>' +
         exclusions.map(e => `<tr>
           <td>${e.index}</td>
+          <td>${e.sourceType
+            ? `<span class="badge ${e.sourceType === 'ATACADO' ? 'badge-blue' : 'badge-yellow'}">${esc(e.sourceType)}</span>`
+            : `<span class="badge badge-red" title="Regra legada sem tipo: não aplicada. Remova e recrie escolhendo ATACADO ou VAREJO.">LEGADO</span>`}</td>
           <td style="word-break:break-all"><span class="badge badge-red">${esc(e.folderName)}</span></td>
           <td><button class="btn-danger btn-sm" onclick="removeExclusion(${e.index})">Remover</button></td>
         </tr>`).join('') +
@@ -464,6 +471,8 @@ async function loadExclusions() {
 
 async function addExclusion() {
   const input = document.getElementById('newExclusion');
+  const typeEl = document.getElementById('newExclusionType');
+  const sourceType = (typeEl?.value || '').trim();
   const folderName = (input?.value || '').trim();
   if (!folderName) return;
 
@@ -471,7 +480,7 @@ async function addExclusion() {
     const r = await fetch(API + '/api/exclusions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ folderName }),
+      body: JSON.stringify({ sourceType, folderName }),
     });
 
     if (!r.ok) {

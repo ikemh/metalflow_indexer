@@ -14,9 +14,9 @@
     }
   ],
   "excludedFolders": [
-    { "folderName": "antigos" },
-    { "folderName": "temp" },
-    { "folderName": "backup" }
+    { "sourceType": "ATACADO", "folderName": "backup" },
+    { "sourceType": "ATACADO", "folderName": "temp" },
+    { "sourceType": "VAREJO", "folderName": "teste" }
   ],
   "watchEnabled": false,
   "watchDebounceSeconds": 15,

@@ -302,7 +302,7 @@ async function runSyncCycle() {
 
       let customers;
       try {
-        customers = await discoverCustomers(root.path);
+        customers = await discoverCustomers(root.path, root.sourceType);
       } catch (err) {
         pushLog(
           "error",
@@ -654,10 +654,25 @@ app.delete("/api/roots/:index", async (req, res) => {
 app.get("/api/exclusions", async (_req, res) => {
   try {
     const config = await readConfig();
-    const exclusions = (config.excludedFolders || []).map((e, i) => ({
-      index: i,
-      ...e,
-    }));
+    const exclusions = (config.excludedFolders || []).map((e, i) => {
+      const rawSourceType = e?.sourceType;
+      const sourceType =
+        rawSourceType === "ATACADO" || rawSourceType === "VAREJO"
+          ? rawSourceType
+          : null;
+
+      // Compat defensiva: regras legadas sem sourceType aparecem na GUI
+      // para o usuário corrigir, mas NÃO são aplicadas pelo scanner/watcher.
+      const folderName = typeof e?.folderName === "string" ? e.folderName : "";
+      const normalizedFolderName = normalizeExclusionName(folderName);
+
+      return {
+        index: i,
+        sourceType,
+        folderName,
+        normalizedFolderName,
+      };
+    });
     res.json(exclusions);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -665,6 +680,11 @@ app.get("/api/exclusions", async (_req, res) => {
 });
 
 app.post("/api/exclusions", async (req, res) => {
+  const sourceType = req.body && req.body.sourceType;
+  if (!["ATACADO", "VAREJO"].includes(sourceType)) {
+    return res.status(400).json({ error: "sourceType must be ATACADO or VAREJO" });
+  }
+
   const raw = req.body && req.body.folderName;
   const normalized = normalizeExclusionName(raw);
 
@@ -683,13 +703,15 @@ app.post("/api/exclusions", async (req, res) => {
   // Duplicata: comparar pela forma normalizada (NFKC + trim + lowercase),
   // de modo que "Antigos", "antigos " e "ANTIGOS" sejam todos a mesma exclusão.
   const duplicate = list.some(
-    (e) => normalizeExclusionName(e?.folderName) === normalized,
+    (e) =>
+      e?.sourceType === sourceType &&
+      normalizeExclusionName(e?.folderName) === normalized,
   );
   if (duplicate) {
     return res.status(409).json({ error: "Pasta já está excluída." });
   }
 
-  list.push({ folderName: normalized });
+  list.push({ sourceType, folderName: normalized });
   config.excludedFolders = list;
 
   try {
@@ -701,11 +723,16 @@ app.post("/api/exclusions", async (req, res) => {
   // Invalida cache do scanner imediatamente.
   clearExcludedFoldersCache();
 
-  pushLog("info", `[config] Exclusion added: ${normalized}`);
+  pushLog("info", `[config] Exclusion added: ${sourceType}:${normalized}`);
 
   if (coerceWatchEnabled(config.watchEnabled)) await applyWatcherConfig();
 
-  res.json({ ok: true, index: list.length - 1, folderName: normalized });
+  res.json({
+    ok: true,
+    index: list.length - 1,
+    sourceType,
+    folderName: normalized,
+  });
 });
 
 app.delete("/api/exclusions/:index", async (req, res) => {
