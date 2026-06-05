@@ -20,5 +20,10 @@
   ],
   "watchEnabled": false,
   "watchDebounceSeconds": 15,
+  "runOnStartup": false,
+  "circuitBreakerEnabled": true,
+  "circuitBreakerFailureThreshold": 3,
+  "circuitBreakerCooldownMinutes": 30,
+  "maxConsecutiveSyncErrors": 3,
   "lastSync": null
 }

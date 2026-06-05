@@ -8,7 +8,20 @@ const {
   normalizeExclusionName,
   coerceWatchEnabled,
   clampWatchDebounceSeconds,
+  coerceBoolean,
+  clampPositiveInt,
+  resolveRunOnStartup,
+  resolveCircuitBreakerEnabled,
+  resolveCircuitBreakerFailureThreshold,
+  resolveCircuitBreakerCooldownMinutes,
+  resolveMaxConsecutiveSyncErrors,
 } = require("./lib/config");
+const {
+  safetyState,
+  isCircuitOpen,
+  recordSyncSuccess,
+  recordSyncFailure,
+} = require("./lib/safety");
 const {
   discoverCustomers,
   scanFolder,
@@ -155,11 +168,14 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
       [],
     );
     if (!emptyResult.ok) {
+      recordSyncFailure(config, emptyResult.error, pushLog);
       pushLog(
         "warn",
         `[sync] Empty folder register failed ${customerFolder}: ${emptyResult.error}`,
       );
       result.error = emptyResult.error;
+    } else {
+      recordSyncSuccess(config);
     }
     return result;
   }
@@ -226,6 +242,7 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
   );
 
   if (syncResult.ok) {
+    recordSyncSuccess(config);
     const d = syncResult.data || {};
     if (d.created || d.updated || d.deleted) {
       pushLog(
@@ -237,6 +254,7 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
     result.updated = d.updated || 0;
     result.deleted = d.deleted || 0;
   } else {
+    recordSyncFailure(config, syncResult.error, pushLog);
     pushLog("error", `[sync] FAILED ${customerFolder}: ${syncResult.error}`);
     result.error = syncResult.error;
   }
@@ -248,10 +266,19 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
 // Sync cycle (varredura completa)
 // ---------------------------------------------------------------------------
 
-async function runSyncCycle() {
+async function runSyncCycle(options = {}) {
+  const { bypassCircuitBreaker = false } = options;
+
   if (state.running) {
     pushLog("warn", "[sync] Cycle already running, skipping");
     return { skipped: true };
+  }
+
+  const config = await readConfig();
+
+  if (!bypassCircuitBreaker && isCircuitOpen(config)) {
+    pushLog("warn", "[safety] Sync cycle skipped: circuit breaker open");
+    return { skipped: true, reason: "circuit_open" };
   }
 
   state.running = true;
@@ -262,8 +289,6 @@ async function runSyncCycle() {
   pushLog("info", `[sync] Cycle #${cycleNum} START`);
 
   try {
-    const config = await readConfig();
-
     if (!config.erpApiUrl || !config.apiKey) {
       pushLog("error", "[sync] Missing erpApiUrl or apiKey in config");
       return { error: "Missing config" };
@@ -315,6 +340,14 @@ async function runSyncCycle() {
       pushLog("info", `[root] Found ${customers.length} customer folders`);
 
       for (const customerFolder of customers) {
+        if (!bypassCircuitBreaker && isCircuitOpen(config)) {
+          pushLog(
+            "warn",
+            "[safety] Sync cycle interrupted: circuit breaker opened mid-cycle",
+          );
+          break;
+        }
+
         const r = await syncCustomerFolder(config, root, customerFolder, {
           source: "cycle",
         });
@@ -379,6 +412,12 @@ async function runSyncCycle() {
  */
 async function syncSingleCustomer(root, customerFolder) {
   const config = await readConfig();
+
+  if (isCircuitOpen(config)) {
+    pushLog("warn", "[watch] sync skipped because circuit breaker is open");
+    return;
+  }
+
   if (!config.erpApiUrl || !config.apiKey) {
     pushLog(
       "warn",
@@ -412,8 +451,8 @@ async function syncSingleCustomer(root, customerFolder) {
 // Restart periodic timer (after config changes)
 // ---------------------------------------------------------------------------
 
-function scheduleCycle() {
-  enqueueSync("cycle", () => runSyncCycle());
+function scheduleCycle(options = {}) {
+  enqueueSync("cycle", () => runSyncCycle(options));
 }
 
 async function restartTimer() {
@@ -505,6 +544,14 @@ app.get("/api/status", async (_req, res) => {
     syncIntervalMinutes: config.syncIntervalMinutes || 15,
     rootCount: (config.roots || []).length,
     discoveredFolders: state.discoveredFolders,
+    circuitOpen: isCircuitOpen(config),
+    circuitOpenUntil: safetyState.circuitOpenUntil
+      ? safetyState.circuitOpenUntil.toISOString()
+      : null,
+    consecutiveSyncFailures: safetyState.consecutiveSyncFailures,
+    lastCircuitReason: safetyState.lastCircuitReason,
+    runOnStartup: resolveRunOnStartup(config),
+    watchEnabled: coerceWatchEnabled(config.watchEnabled),
   });
 });
 
@@ -528,6 +575,11 @@ app.get("/api/config", async (_req, res) => {
     thumbConcurrency: config.thumbConcurrency || 4,
     watchEnabled: coerceWatchEnabled(config.watchEnabled),
     watchDebounceSeconds: clampWatchDebounceSeconds(config.watchDebounceSeconds),
+    runOnStartup: resolveRunOnStartup(config),
+    circuitBreakerEnabled: resolveCircuitBreakerEnabled(config),
+    circuitBreakerFailureThreshold: resolveCircuitBreakerFailureThreshold(config),
+    circuitBreakerCooldownMinutes: resolveCircuitBreakerCooldownMinutes(config),
+    maxConsecutiveSyncErrors: resolveMaxConsecutiveSyncErrors(config),
     roots: config.roots || [],
     lastSync: config.lastSync,
   });
@@ -542,6 +594,11 @@ app.patch("/api/config", async (req, res) => {
     "thumbConcurrency",
     "watchEnabled",
     "watchDebounceSeconds",
+    "runOnStartup",
+    "circuitBreakerEnabled",
+    "circuitBreakerFailureThreshold",
+    "circuitBreakerCooldownMinutes",
+    "maxConsecutiveSyncErrors",
   ];
 
   // Snapshot para detectar mudanças relevantes ao watcher.
@@ -557,6 +614,28 @@ app.patch("/api/config", async (req, res) => {
       } else if (key === "watchDebounceSeconds") {
         config.watchDebounceSeconds = clampWatchDebounceSeconds(
           req.body.watchDebounceSeconds,
+        );
+      } else if (key === "runOnStartup") {
+        config.runOnStartup = coerceBoolean(req.body.runOnStartup, false);
+      } else if (key === "circuitBreakerEnabled") {
+        config.circuitBreakerEnabled = coerceBoolean(
+          req.body.circuitBreakerEnabled,
+          true,
+        );
+      } else if (key === "circuitBreakerFailureThreshold") {
+        config.circuitBreakerFailureThreshold = clampPositiveInt(
+          req.body.circuitBreakerFailureThreshold,
+          { default: 3, min: 1, max: 100 },
+        );
+      } else if (key === "circuitBreakerCooldownMinutes") {
+        config.circuitBreakerCooldownMinutes = clampPositiveInt(
+          req.body.circuitBreakerCooldownMinutes,
+          { default: 30, min: 1, max: 1440 },
+        );
+      } else if (key === "maxConsecutiveSyncErrors") {
+        config.maxConsecutiveSyncErrors = clampPositiveInt(
+          req.body.maxConsecutiveSyncErrors,
+          { default: 3, min: 1, max: 100 },
         );
       } else {
         config[key] = req.body[key];
@@ -778,7 +857,8 @@ app.post("/api/sync", async (_req, res) => {
 
   res.json({ ok: true, message: "Sync started" });
   // Passa pela fila para nunca cruzar com sync parcial do watcher.
-  scheduleCycle();
+  // Sync manual ignora circuit breaker para permitir retry operacional.
+  scheduleCycle({ bypassCircuitBreaker: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -813,8 +893,15 @@ async function main() {
   // No ambiente local (Fedora + SMB + Tailscale), watchEnabled deve ficar false.
   await applyWatcherConfig();
 
-  // Primeiro ciclo + agendamento periódico, ambos passando pela fila.
-  scheduleCycle();
+  // Primeiro ciclo opcional + agendamento periódico, ambos passando pela fila.
+  if (resolveRunOnStartup(config)) {
+    scheduleCycle();
+  } else {
+    pushLog(
+      "info",
+      "[indexer] Startup sync disabled by config.runOnStartup=false",
+    );
+  }
   syncTimer = setInterval(scheduleCycle, intervalMs);
 }
 

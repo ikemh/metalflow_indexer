@@ -16,6 +16,7 @@ Serviço Node.js que executa localmente no **Windows do cliente** em modo **estr
 - **Sincronização com backend** — Envia metadados e thumbnails para o backend ERP via API REST
 - **GUI web embarcada** — Interface de administração local para status, configuração, logs e trigger manual
 - **Timer automático** — Ciclos de sincronização em intervalo configurável (padrão 15 min)
+- **Circuit breaker** — Pausa sync automático após falhas consecutivas no backend (padrão: 3 falhas → 30 min)
 - **Retry com backoff** — Tolerância a falhas de rede com retry progressivo (2s, 5s, 15s)
 - **Safe Delete Validation** — Deleções no backend só ocorrem quando o scan é completo (`isCompleteScan = true`)
 - **Leve e autônomo** — Apenas 3 dependências Node.js (express, form-data)
@@ -184,7 +185,7 @@ Interface de administração dark mode com abas:
 | Método | Rota | Descrição |
 |--------|------|-----------|
 | `GET` | `/api/config` | Configurações atuais (sem API Key) |
-| `PATCH` | `/api/config` | Atualiza configurações (erpApiUrl, apiKey, syncIntervalMinutes, thumbConcurrency) |
+| `PATCH` | `/api/config` | Atualiza configurações (erpApiUrl, apiKey, syncIntervalMinutes, thumbConcurrency, runOnStartup, circuit breaker) |
 
 ### Roots
 
@@ -217,6 +218,13 @@ Criado a partir de `config.example.json`:
       "sourceType": "VAREJO"
     }
   ],
+  "watchEnabled": false,
+  "watchDebounceSeconds": 15,
+  "runOnStartup": false,
+  "circuitBreakerEnabled": true,
+  "circuitBreakerFailureThreshold": 3,
+  "circuitBreakerCooldownMinutes": 30,
+  "maxConsecutiveSyncErrors": 3,
   "lastSync": null
 }
 ```
@@ -228,7 +236,56 @@ Criado a partir de `config.example.json`:
 | `syncIntervalMinutes` | Intervalo entre ciclos automáticos (padrão: 15) |
 | `thumbConcurrency` | Número de workers simultâneos para geração de thumbnails (padrão: 4) |
 | `roots` | Lista de caminhos de pastas raiz com tipo de origem (ATACADO/VAREJO) |
+| `watchEnabled` | Habilita watcher de filesystem (padrão: false) |
+| `watchDebounceSeconds` | Debounce do watcher em segundos (padrão: 15) |
+| `runOnStartup` | Executa sync completo ao iniciar o serviço (padrão: false) |
+| `circuitBreakerEnabled` | Habilita pausa automática após falhas de sync (padrão: true) |
+| `circuitBreakerFailureThreshold` | Falhas consecutivas antes de abrir o circuito (padrão: 3) |
+| `circuitBreakerCooldownMinutes` | Minutos de pausa com circuito aberto (padrão: 30) |
+| `maxConsecutiveSyncErrors` | Fallback do threshold se `circuitBreakerFailureThreshold` ausente (padrão: 3) |
 | `lastSync` | Timestamp da última sincronização (gerado automaticamente) |
+
+### Proteções operacionais
+
+O indexer inclui proteções para evitar carga excessiva no backend ERP após incidentes (ex.: reorganização massiva de pastas + erros HTTP 500).
+
+**`runOnStartup` (padrão: false)**  
+Ao iniciar, o serviço sobe a GUI e o timer periódico, mas **não** dispara sync imediato. Log esperado:
+
+```
+[indexer] Startup sync disabled by config.runOnStartup=false
+```
+
+**Circuit breaker (padrão: habilitado)**  
+Cada falha em `POST /indexer/sync` (HTTP 500, timeout, rede) incrementa um contador consecutivo. Um sync bem-sucedido zera o contador. Após atingir o threshold (padrão 3), o indexer:
+
+- Abre o circuito por `circuitBreakerCooldownMinutes` (padrão 30 min)
+- **Bloqueia** sync automático do timer e sync disparado pelo watcher
+- Mantém a GUI disponível
+
+**Sync manual (`POST /api/sync` / botão "Sincronizar agora")**  
+O sync manual **ignora** o circuit breaker — é uma ação operacional explícita para recuperação ou teste. Use com cautela: se o backend ERP continuar respondendo 500/timeouts, o sync manual ainda vai tentar e pode gerar carga na VPS.
+
+Enquanto o circuito está aberto, logs típicos:
+
+```
+[safety] Circuit breaker opened for 30min: HTTP 500: ...
+[safety] Sync cycle skipped: circuit breaker open
+[watch] sync skipped because circuit breaker is open
+```
+
+**Monitoramento via `/api/status`:**
+
+```json
+{
+  "circuitOpen": true,
+  "circuitOpenUntil": "2026-06-04T15:30:00.000Z",
+  "consecutiveSyncFailures": 3,
+  "lastCircuitReason": "HTTP 500: ...",
+  "runOnStartup": false,
+  "watchEnabled": false
+}
+```
 
 ### Environment Variables
 
