@@ -313,8 +313,11 @@ async function runSyncCycle(options = {}) {
     let totalDeleted = 0;
     let totalErrors = 0;
     const folders = [];
+    let circuitInterrupted = false;
 
     for (const root of config.roots) {
+      if (circuitInterrupted) break;
+
       const normalizedRoot = normalizeRootPath(root.path);
       pushLog("info", `[root] ${root.path} (${root.sourceType})`);
 
@@ -345,6 +348,7 @@ async function runSyncCycle(options = {}) {
             "warn",
             "[safety] Sync cycle interrupted: circuit breaker opened mid-cycle",
           );
+          circuitInterrupted = true;
           break;
         }
 
