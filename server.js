@@ -43,6 +43,7 @@ const {
   checkBackendHealth,
   uploadThumbToErp,
   batchSyncToErp,
+  reconcileFoldersToErp,
 } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 const { createWatcher } = require("./lib/watcher");
@@ -452,6 +453,31 @@ async function runSyncCycle(options = {}) {
       }
 
       pushLog("info", `[root] Found ${customers.length} customer folders`);
+
+      const reconcileResult = await reconcileFoldersToErp(
+        config.erpApiUrl,
+        config.apiKey,
+        root.sourceType,
+        normalizedRoot,
+        customers,
+        true,
+      );
+
+      if (!reconcileResult.ok) {
+        recordSyncFailure(
+          config,
+          `reconcile: ${reconcileResult.error}`,
+          pushLog,
+        );
+        totalErrors++;
+      } else {
+        recordSyncSuccess(config);
+        const { received, archived } = reconcileResult.data;
+        pushLog(
+          "info",
+          `[folders] reconcile ${root.sourceType} received=${received} archived=${archived}`,
+        );
+      }
 
       for (const customerFolder of customers) {
         if (!bypassCircuitBreaker && isCircuitOpen(config)) {
