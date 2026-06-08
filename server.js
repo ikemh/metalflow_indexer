@@ -15,6 +15,16 @@ const {
   resolveCircuitBreakerFailureThreshold,
   resolveCircuitBreakerCooldownMinutes,
   resolveMaxConsecutiveSyncErrors,
+  resolveSmartSyncEnabled,
+  resolveFolderSignatureCacheEnabled,
+  resolveMaxWatcherSyncsPerMinute,
+  resolveSyncIntervalMinutes,
+  resolveThumbConcurrency,
+  resolveWatchUsePolling,
+  resolveWatchIntervalMs,
+  resolveWatchBinaryIntervalMs,
+  resolveWatchStabilityThresholdMs,
+  resolveWatchPollIntervalMs,
 } = require("./lib/config");
 const {
   safetyState,
@@ -36,6 +46,17 @@ const {
 } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 const { createWatcher } = require("./lib/watcher");
+const {
+  computeFolderSignature,
+  makeFolderSignatureKey,
+  loadSignatureCache,
+  saveSignatureCache,
+  getCachedSignature,
+  setCachedSignature,
+  signaturesEqual,
+  isCacheDirty,
+  getCache,
+} = require("./lib/folder-signature");
 
 const PORT = process.env.PORT || 4000;
 
@@ -88,22 +109,25 @@ function enqueueSync(label, fn) {
     });
   return syncQueue;
 }
+// ---------------------------------------------------------------------------
+// Watcher rate limiter state
+// ---------------------------------------------------------------------------
 
-/**
- * Valida e satura `thumbConcurrency` da config:
- *   - converte para número (descarta strings/NaN)
- *   - default 4 se ausente/null/string vazia/NaN
- *   - clamp para [1, 8] (0 ou negativo viram 1; > 8 viram 8)
- *   - aplicado ANTES de criar workers em thumbgen
- */
-function clampThumbConcurrency(raw) {
-  if (raw === null || raw === undefined || raw === "") return 4;
-  let n = Number(raw);
-  if (!Number.isFinite(n) || Number.isNaN(n)) return 4;
-  n = Math.floor(n);
-  if (n < 1) n = 1;
-  if (n > 8) n = 8;
-  return n;
+const watcherRateState = {
+  windowStartedAt: 0,
+  startedInWindow: 0,
+  deferredKeys: new Map(),
+  flushTimer: null,
+};
+
+function resetWatcherRateLimiter() {
+  if (watcherRateState.flushTimer) {
+    clearTimeout(watcherRateState.flushTimer);
+    watcherRateState.flushTimer = null;
+  }
+  watcherRateState.deferredKeys.clear();
+  watcherRateState.windowStartedAt = 0;
+  watcherRateState.startedInWindow = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -117,13 +141,16 @@ function clampThumbConcurrency(raw) {
  *   - runSyncCycle() — itera todos os clientes de todos os roots;
  *   - watcher       — sincroniza apenas o cliente afetado por um evento.
  *
+ * Smart skip: se config.smartSyncEnabled=true e source !== "manual-force",
+ * calcula assinatura de metadados e pula pasta unchanged.
+ *
  * Retorna estatísticas para o caller agregar.
  *
  * Atenção: NÃO toca em state.running. A serialização entre chamadas é
  * responsabilidade do caller (via enqueueSync).
  */
 async function syncCustomerFolder(config, root, customerFolder, options = {}) {
-  const { source = "cycle" } = options;
+  const { source = "cycle", bypassSmartSync = false } = options;
   const normalizedRoot = normalizeRootPath(root.path);
   const customerPath = path.join(root.path, customerFolder);
 
@@ -138,6 +165,8 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
     deleted: 0,
     error: null,
     source,
+    skipped: false,
+    smartSkipped: false,
   };
 
   const { files, warnings } = await scanFolder(
@@ -157,6 +186,48 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
   result.isCompleteScan = isCompleteScan;
   result.fileCount = files.length;
 
+  // --- Smart skip ---
+  const smartEnabled = resolveSmartSyncEnabled(config);
+  const cacheEnabled = resolveFolderSignatureCacheEnabled(config);
+  const useSmartSkip =
+    smartEnabled &&
+    isCompleteScan &&
+    !bypassSmartSync &&
+    source !== "manual-force";
+
+  if (smartEnabled && !isCompleteScan && !bypassSmartSync && source !== "manual-force") {
+    pushLog(
+      "info",
+      `[smart] skip disabled for ${customerFolder} (${root.sourceType}/${source}) because scan is incomplete`,
+    );
+  }
+
+  let currentSignature = null;
+  let sigKey = null;
+
+  if (useSmartSkip || cacheEnabled) {
+    currentSignature = computeFolderSignature(files);
+    sigKey = makeFolderSignatureKey({
+      sourceType: root.sourceType,
+      rootPath: normalizedRoot,
+      customerFolder,
+    });
+  }
+
+  if (useSmartSkip && currentSignature && sigKey) {
+    const cachedSig = getCachedSignature(sigKey);
+    if (cachedSig && signaturesEqual(currentSignature, cachedSig)) {
+      pushLog(
+        "info",
+        `[smart] skipped unchanged folder ${customerFolder} (${root.sourceType}/${source}) files=${files.length}`,
+      );
+      result.skipped = true;
+      result.smartSkipped = true;
+      return result;
+    }
+  }
+
+  // --- Normal sync flow ---
   if (files.length === 0) {
     const emptyResult = await batchSyncToErp(
       config.erpApiUrl,
@@ -176,12 +247,20 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
       result.error = emptyResult.error;
     } else {
       recordSyncSuccess(config);
+      // Cache signature for empty folder on success
+      if (cacheEnabled && sigKey && currentSignature && isCompleteScan) {
+        setCachedSignature(sigKey, currentSignature);
+        pushLog(
+          "info",
+          `[smart] cached signature ${customerFolder} (${root.sourceType}/${source}) files=0`,
+        );
+      }
     }
     return result;
   }
 
   const thumbResult = await generateThumbsForFiles(files, customerPath, {
-    concurrency: clampThumbConcurrency(config.thumbConcurrency),
+    concurrency: resolveThumbConcurrency(config),
     customerLabel: customerFolder,
   });
   const filesWithThumbs = thumbResult.files;
@@ -193,6 +272,13 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
     thumbStats.timeout > 0 ||
     thumbStats.missing > 0 ||
     thumbStats.locked > 0;
+
+  // Transient issues = thumb may succeed on next scan; unsafe to cache.
+  // failed = usually permanently invalid DXFs; safe to cache.
+  const hasTransientThumbIssues =
+    thumbStats.timeout > 0 ||
+    thumbStats.locked > 0 ||
+    thumbStats.missing > 0;
 
   if (hasThumbEvents) {
     pushLog(
@@ -253,10 +339,25 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
     result.created = d.created || 0;
     result.updated = d.updated || 0;
     result.deleted = d.deleted || 0;
+
+    // Update signature cache only on complete scan + sync success + no transient thumb issues
+    if (cacheEnabled && sigKey && currentSignature && isCompleteScan && !hasTransientThumbIssues) {
+      setCachedSignature(sigKey, currentSignature);
+      pushLog(
+        "info",
+        `[smart] cached signature ${customerFolder} (${root.sourceType}/${source}) files=${files.length}`,
+      );
+    } else if (cacheEnabled && sigKey && currentSignature && isCompleteScan && hasTransientThumbIssues) {
+      pushLog(
+        "info",
+        `[smart] signature not cached for ${customerFolder} due to transient thumb issues timeout=${thumbStats.timeout} locked=${thumbStats.locked} missing=${thumbStats.missing}`,
+      );
+    }
   } else {
     recordSyncFailure(config, syncResult.error, pushLog);
     pushLog("error", `[sync] FAILED ${customerFolder}: ${syncResult.error}`);
     result.error = syncResult.error;
+    // Do NOT update cache on failure
   }
 
   return result;
@@ -306,12 +407,22 @@ async function runSyncCycle(options = {}) {
       return { error: "Backend unreachable" };
     }
 
+    // Load signature cache for smart skip
+    const cacheEnabled = resolveFolderSignatureCacheEnabled(config);
+    if (cacheEnabled) {
+      const cachePath = path.resolve(
+        path.join(__dirname, config.folderSignatureCachePath || "data/folder-signatures.json"),
+      );
+      await loadSignatureCache(cachePath);
+    }
+
     let totalFiles = 0;
     let totalCustomers = 0;
     let totalCreated = 0;
     let totalUpdated = 0;
     let totalDeleted = 0;
     let totalErrors = 0;
+    let totalSmartSkipped = 0;
     const folders = [];
     let circuitInterrupted = false;
 
@@ -362,6 +473,7 @@ async function runSyncCycle(options = {}) {
           rootPath: normalizedRoot,
           fileCount: r.fileCount,
           isCompleteScan: r.isCompleteScan,
+          smartSkipped: r.smartSkipped || false,
           lastSeenAt: new Date().toISOString(),
         });
 
@@ -371,6 +483,19 @@ async function runSyncCycle(options = {}) {
         totalUpdated += r.updated;
         totalDeleted += r.deleted;
         if (r.error) totalErrors++;
+        if (r.smartSkipped) totalSmartSkipped++;
+      }
+    }
+
+    // Persist signature cache after cycle
+    if (cacheEnabled && isCacheDirty()) {
+      try {
+        const cachePath = path.resolve(
+          path.join(__dirname, config.folderSignatureCachePath || "data/folder-signatures.json"),
+        );
+        await saveSignatureCache(cachePath, getCache());
+      } catch (err) {
+        pushLog("warn", `[smart] failed to save signature cache: ${err.message}`);
       }
     }
 
@@ -386,7 +511,7 @@ async function runSyncCycle(options = {}) {
 
     pushLog(
       "info",
-      `[sync] Cycle #${cycleNum} DONE in ${(durationMs / 1000).toFixed(1)}s — customers=${totalCustomers} files=${totalFiles} +${totalCreated} ~${totalUpdated} -${totalDeleted} errors=${totalErrors}`,
+      `[sync] Cycle #${cycleNum} DONE in ${(durationMs / 1000).toFixed(1)}s — customers=${totalCustomers} files=${totalFiles} skipped=${totalSmartSkipped} +${totalCreated} ~${totalUpdated} -${totalDeleted} errors=${totalErrors}`,
     );
 
     return {
@@ -398,6 +523,7 @@ async function runSyncCycle(options = {}) {
       totalUpdated,
       totalDeleted,
       totalErrors,
+      totalSmartSkipped,
     };
   } catch (err) {
     pushLog("error", `[sync] Cycle #${cycleNum} CRASHED: ${err.message}`);
@@ -448,7 +574,28 @@ async function syncSingleCustomer(root, customerFolder) {
     return;
   }
 
+  // Load signature cache for smart skip
+  const cacheEnabled = resolveFolderSignatureCacheEnabled(config);
+  if (cacheEnabled) {
+    const cachePath = path.resolve(
+      path.join(__dirname, config.folderSignatureCachePath || "data/folder-signatures.json"),
+    );
+    await loadSignatureCache(cachePath);
+  }
+
   await syncCustomerFolder(config, root, customerFolder, { source: "watch" });
+
+  // Persist cache changes
+  if (cacheEnabled && isCacheDirty()) {
+    try {
+      const cachePath = path.resolve(
+        path.join(__dirname, config.folderSignatureCachePath || "data/folder-signatures.json"),
+      );
+      await saveSignatureCache(cachePath, getCache());
+    } catch (err) {
+      pushLog("warn", `[smart] failed to save signature cache: ${err.message}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,11 +609,12 @@ function scheduleCycle(options = {}) {
 async function restartTimer() {
   if (syncTimer) clearInterval(syncTimer);
   const config = await readConfig();
-  const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
+  const minutes = resolveSyncIntervalMinutes(config);
+  const intervalMs = minutes * 60 * 1000;
   syncTimer = setInterval(scheduleCycle, intervalMs);
   pushLog(
     "info",
-    `[indexer] Timer restarted: ${config.syncIntervalMinutes || 15}min`,
+    `[indexer] Timer restarted: ${minutes}min`,
   );
 }
 
@@ -490,6 +638,10 @@ async function restartTimer() {
  *     watcher e loga `[watch] enabled: roots=N debounce=Xs`.
  */
 async function applyWatcherConfig() {
+  // Always reset rate limiter when reconfiguring watcher — stale deferred
+  // events from a previous config must never enqueue syncs.
+  resetWatcherRateLimiter();
+
   if (watcherInstance) {
     try {
       await watcherInstance.close();
@@ -506,15 +658,75 @@ async function applyWatcherConfig() {
     return;
   }
 
+  const maxPerMinute = resolveMaxWatcherSyncsPerMinute(config);
+
   watcherInstance = createWatcher({
     config,
     log: pushLog,
     onCustomerChanged: ({ root, customerFolder }) => {
-      // Enfileira: nunca roda sync parcial em paralelo com sync completo
-      // ou com outro sync parcial.
-      enqueueSync(`watch:${customerFolder}`, () =>
-        syncSingleCustomer(root, customerFolder),
-      );
+      const key = `${root.sourceType}::${root.path}::${customerFolder}`;
+      const now = Date.now();
+
+      // Reset window if 60s elapsed
+      if (now - watcherRateState.windowStartedAt >= 60000) {
+        watcherRateState.windowStartedAt = now;
+        watcherRateState.startedInWindow = 0;
+      }
+
+      if (watcherRateState.startedInWindow < maxPerMinute) {
+        // Under limit: enqueue normally
+        watcherRateState.startedInWindow++;
+        enqueueSync(`watch:${customerFolder}`, () =>
+          syncSingleCustomer(root, customerFolder),
+        );
+      } else {
+        // Rate limit exceeded: defer
+        pushLog(
+          "warn",
+          `[watch] rate limit reached, deferred ${customerFolder}`,
+        );
+        // Store the root+customerFolder for deferred flush
+        watcherRateState.deferredKeys.set(key, { root, customerFolder });
+
+        // Schedule flush if not already scheduled
+        if (!watcherRateState.flushTimer) {
+          const flushDeferred = () => {
+            watcherRateState.flushTimer = null;
+            const deferred = new Map(watcherRateState.deferredKeys);
+            watcherRateState.deferredKeys.clear();
+            // Reset window for the flush
+            watcherRateState.windowStartedAt = Date.now();
+            watcherRateState.startedInWindow = 0;
+
+            for (const [, { root: dRoot, customerFolder: dFolder }] of deferred) {
+              if (watcherRateState.startedInWindow < maxPerMinute) {
+                watcherRateState.startedInWindow++;
+                enqueueSync(`watch-deferred:${dFolder}`, () =>
+                  syncSingleCustomer(dRoot, dFolder),
+                );
+              } else {
+                // Still over limit, re-defer
+                watcherRateState.deferredKeys.set(
+                  `${dRoot.sourceType}::${dRoot.path}::${dFolder}`,
+                  { root: dRoot, customerFolder: dFolder },
+                );
+              }
+            }
+
+            // If there are still deferred items, schedule another flush
+            if (watcherRateState.deferredKeys.size > 0 && !watcherRateState.flushTimer) {
+              watcherRateState.flushTimer = setTimeout(flushDeferred, 60000);
+              if (typeof watcherRateState.flushTimer.unref === "function") {
+                watcherRateState.flushTimer.unref();
+              }
+            }
+          };
+          watcherRateState.flushTimer = setTimeout(flushDeferred, 60000);
+          if (typeof watcherRateState.flushTimer.unref === "function") {
+            watcherRateState.flushTimer.unref();
+          }
+        }
+      }
     },
   });
 
@@ -545,7 +757,7 @@ app.get("/api/status", async (_req, res) => {
     lastDurationMs: state.lastDurationMs,
     lastError: state.lastError,
     cycleCount: state.cycleCount,
-    syncIntervalMinutes: config.syncIntervalMinutes || 15,
+    syncIntervalMinutes: resolveSyncIntervalMinutes(config),
     rootCount: (config.roots || []).length,
     discoveredFolders: state.discoveredFolders,
     circuitOpen: isCircuitOpen(config),
@@ -556,6 +768,16 @@ app.get("/api/status", async (_req, res) => {
     lastCircuitReason: safetyState.lastCircuitReason,
     runOnStartup: resolveRunOnStartup(config),
     watchEnabled: coerceWatchEnabled(config.watchEnabled),
+    smartSyncEnabled: resolveSmartSyncEnabled(config),
+    maxWatcherSyncsPerMinute: resolveMaxWatcherSyncsPerMinute(config),
+    watcherConfig: {
+      usePolling: resolveWatchUsePolling(config),
+      intervalMs: resolveWatchIntervalMs(config),
+      binaryIntervalMs: resolveWatchBinaryIntervalMs(config),
+      stabilityThresholdMs: resolveWatchStabilityThresholdMs(config),
+      pollIntervalMs: resolveWatchPollIntervalMs(config),
+      debounceSeconds: clampWatchDebounceSeconds(config.watchDebounceSeconds),
+    },
   });
 });
 
@@ -575,8 +797,8 @@ app.get("/api/config", async (_req, res) => {
   const config = await readConfig();
   res.json({
     erpApiUrl: config.erpApiUrl || "",
-    syncIntervalMinutes: config.syncIntervalMinutes || 15,
-    thumbConcurrency: config.thumbConcurrency || 4,
+    syncIntervalMinutes: resolveSyncIntervalMinutes(config),
+    thumbConcurrency: resolveThumbConcurrency(config),
     watchEnabled: coerceWatchEnabled(config.watchEnabled),
     watchDebounceSeconds: clampWatchDebounceSeconds(config.watchDebounceSeconds),
     runOnStartup: resolveRunOnStartup(config),
@@ -584,6 +806,17 @@ app.get("/api/config", async (_req, res) => {
     circuitBreakerFailureThreshold: resolveCircuitBreakerFailureThreshold(config),
     circuitBreakerCooldownMinutes: resolveCircuitBreakerCooldownMinutes(config),
     maxConsecutiveSyncErrors: resolveMaxConsecutiveSyncErrors(config),
+    // Smart sync
+    smartSyncEnabled: resolveSmartSyncEnabled(config),
+    folderSignatureCacheEnabled: resolveFolderSignatureCacheEnabled(config),
+    folderSignatureCachePath: config.folderSignatureCachePath || "data/folder-signatures.json",
+    maxWatcherSyncsPerMinute: resolveMaxWatcherSyncsPerMinute(config),
+    // Watcher tuning
+    watchUsePolling: resolveWatchUsePolling(config),
+    watchIntervalMs: resolveWatchIntervalMs(config),
+    watchBinaryIntervalMs: resolveWatchBinaryIntervalMs(config),
+    watchStabilityThresholdMs: resolveWatchStabilityThresholdMs(config),
+    watchPollIntervalMs: resolveWatchPollIntervalMs(config),
     roots: config.roots || [],
     lastSync: config.lastSync,
   });
@@ -591,74 +824,98 @@ app.get("/api/config", async (_req, res) => {
 
 app.patch("/api/config", async (req, res) => {
   const config = await readConfig();
-  const allowed = [
-    "erpApiUrl",
-    "apiKey",
-    "syncIntervalMinutes",
-    "thumbConcurrency",
-    "watchEnabled",
-    "watchDebounceSeconds",
-    "runOnStartup",
-    "circuitBreakerEnabled",
-    "circuitBreakerFailureThreshold",
-    "circuitBreakerCooldownMinutes",
-    "maxConsecutiveSyncErrors",
-  ];
 
-  // Snapshot para detectar mudanças relevantes ao watcher.
+  // Snapshot para detectar mudanças relevantes ao watcher e timer.
   const prevWatchEnabled = coerceWatchEnabled(config.watchEnabled);
-  const prevWatchDebounce = clampWatchDebounceSeconds(
-    config.watchDebounceSeconds,
-  );
+  const prevWatchDebounce = clampWatchDebounceSeconds(config.watchDebounceSeconds);
+  const prevWatchIntervalMs = resolveWatchIntervalMs(config);
+  const prevWatchBinaryIntervalMs = resolveWatchBinaryIntervalMs(config);
+  const prevWatchUsePolling = resolveWatchUsePolling(config);
+  const prevWatchStabilityThresholdMs = resolveWatchStabilityThresholdMs(config);
+  const prevWatchPollIntervalMs = resolveWatchPollIntervalMs(config);
+  const prevMaxWatcherSyncsPerMinute = resolveMaxWatcherSyncsPerMinute(config);
+  const prevSyncIntervalMinutes = resolveSyncIntervalMinutes(config);
 
-  for (const key of allowed) {
-    if (req.body[key] !== undefined) {
-      if (key === "watchEnabled") {
-        config.watchEnabled = coerceWatchEnabled(req.body.watchEnabled);
-      } else if (key === "watchDebounceSeconds") {
-        config.watchDebounceSeconds = clampWatchDebounceSeconds(
-          req.body.watchDebounceSeconds,
-        );
-      } else if (key === "runOnStartup") {
-        config.runOnStartup = coerceBoolean(req.body.runOnStartup, false);
-      } else if (key === "circuitBreakerEnabled") {
-        config.circuitBreakerEnabled = coerceBoolean(
-          req.body.circuitBreakerEnabled,
-          true,
-        );
-      } else if (key === "circuitBreakerFailureThreshold") {
-        config.circuitBreakerFailureThreshold = clampPositiveInt(
-          req.body.circuitBreakerFailureThreshold,
-          { default: 3, min: 1, max: 100 },
-        );
-      } else if (key === "circuitBreakerCooldownMinutes") {
-        config.circuitBreakerCooldownMinutes = clampPositiveInt(
-          req.body.circuitBreakerCooldownMinutes,
-          { default: 30, min: 1, max: 1440 },
-        );
-      } else if (key === "maxConsecutiveSyncErrors") {
-        config.maxConsecutiveSyncErrors = clampPositiveInt(
-          req.body.maxConsecutiveSyncErrors,
-          { default: 3, min: 1, max: 100 },
-        );
-      } else {
-        config[key] = req.body[key];
-      }
-    }
+  // --- Apply fields with coercion/clamp ---
+  const b = req.body;
+  if (b.erpApiUrl !== undefined) config.erpApiUrl = b.erpApiUrl;
+  if (b.apiKey !== undefined) config.apiKey = b.apiKey;
+  if (b.syncIntervalMinutes !== undefined) {
+    config.syncIntervalMinutes = clampPositiveInt(b.syncIntervalMinutes, { default: 720, min: 30, max: 1440 });
+  }
+  if (b.thumbConcurrency !== undefined) {
+    config.thumbConcurrency = clampPositiveInt(b.thumbConcurrency, { default: 1, min: 1, max: 4 });
+  }
+  if (b.watchEnabled !== undefined) {
+    config.watchEnabled = coerceWatchEnabled(b.watchEnabled);
+  }
+  if (b.watchDebounceSeconds !== undefined) {
+    config.watchDebounceSeconds = clampWatchDebounceSeconds(b.watchDebounceSeconds);
+  }
+  if (b.runOnStartup !== undefined) {
+    config.runOnStartup = coerceBoolean(b.runOnStartup, false);
+  }
+  if (b.circuitBreakerEnabled !== undefined) {
+    config.circuitBreakerEnabled = coerceBoolean(b.circuitBreakerEnabled, true);
+  }
+  if (b.circuitBreakerFailureThreshold !== undefined) {
+    config.circuitBreakerFailureThreshold = clampPositiveInt(b.circuitBreakerFailureThreshold, { default: 3, min: 1, max: 100 });
+  }
+  if (b.circuitBreakerCooldownMinutes !== undefined) {
+    config.circuitBreakerCooldownMinutes = clampPositiveInt(b.circuitBreakerCooldownMinutes, { default: 30, min: 1, max: 1440 });
+  }
+  if (b.maxConsecutiveSyncErrors !== undefined) {
+    config.maxConsecutiveSyncErrors = clampPositiveInt(b.maxConsecutiveSyncErrors, { default: 3, min: 1, max: 100 });
+  }
+  // Smart sync
+  if (b.smartSyncEnabled !== undefined) {
+    config.smartSyncEnabled = coerceBoolean(b.smartSyncEnabled, true);
+  }
+  if (b.folderSignatureCacheEnabled !== undefined) {
+    config.folderSignatureCacheEnabled = coerceBoolean(b.folderSignatureCacheEnabled, true);
+  }
+  if (b.maxWatcherSyncsPerMinute !== undefined) {
+    config.maxWatcherSyncsPerMinute = clampPositiveInt(b.maxWatcherSyncsPerMinute, { default: 10, min: 1, max: 120 });
+  }
+  // Watcher tuning
+  if (b.watchUsePolling !== undefined) {
+    config.watchUsePolling = coerceBoolean(b.watchUsePolling, true);
+  }
+  if (b.watchIntervalMs !== undefined) {
+    config.watchIntervalMs = clampPositiveInt(b.watchIntervalMs, { default: 15000, min: 5000, max: 60000 });
+  }
+  if (b.watchBinaryIntervalMs !== undefined) {
+    config.watchBinaryIntervalMs = clampPositiveInt(b.watchBinaryIntervalMs, { default: 30000, min: 10000, max: 120000 });
+  }
+  if (b.watchStabilityThresholdMs !== undefined) {
+    config.watchStabilityThresholdMs = clampPositiveInt(b.watchStabilityThresholdMs, { default: 5000, min: 1000, max: 30000 });
+  }
+  if (b.watchPollIntervalMs !== undefined) {
+    config.watchPollIntervalMs = clampPositiveInt(b.watchPollIntervalMs, { default: 1000, min: 500, max: 10000 });
   }
 
   await writeConfig(config);
-  await restartTimer();
 
+  // Restart timer if interval changed
+  const newSyncIntervalMinutes = resolveSyncIntervalMinutes(config);
+  if (newSyncIntervalMinutes !== prevSyncIntervalMinutes) {
+    await restartTimer();
+  }
+
+  // Restart watcher if any watch-related field changed
   const newWatchEnabled = coerceWatchEnabled(config.watchEnabled);
-  const newWatchDebounce = clampWatchDebounceSeconds(
-    config.watchDebounceSeconds,
-  );
-
-  if (
+  const newWatchDebounce = clampWatchDebounceSeconds(config.watchDebounceSeconds);
+  const needsWatcherRestart =
     newWatchEnabled !== prevWatchEnabled ||
-    newWatchDebounce !== prevWatchDebounce
-  ) {
+    newWatchDebounce !== prevWatchDebounce ||
+    resolveWatchIntervalMs(config) !== prevWatchIntervalMs ||
+    resolveWatchBinaryIntervalMs(config) !== prevWatchBinaryIntervalMs ||
+    resolveWatchUsePolling(config) !== prevWatchUsePolling ||
+    resolveWatchStabilityThresholdMs(config) !== prevWatchStabilityThresholdMs ||
+    resolveWatchPollIntervalMs(config) !== prevWatchPollIntervalMs ||
+    resolveMaxWatcherSyncsPerMinute(config) !== prevMaxWatcherSyncsPerMinute;
+
+  if (needsWatcherRestart) {
     await applyWatcherConfig();
   }
 
@@ -871,7 +1128,8 @@ app.post("/api/sync", async (_req, res) => {
 
 async function main() {
   const config = await readConfig();
-  const intervalMs = (config.syncIntervalMinutes || 15) * 60 * 1000;
+  const minutes = resolveSyncIntervalMinutes(config);
+  const intervalMs = minutes * 60 * 1000;
 
   pushLog("info", "[indexer] Starting DXF File Indexer");
   pushLog("info", `[indexer] Backend: ${config.erpApiUrl}`);
@@ -881,7 +1139,11 @@ async function main() {
   );
   pushLog(
     "info",
-    `[indexer] Sync interval: ${config.syncIntervalMinutes || 15}min`,
+    `[indexer] Sync interval: ${minutes}min`,
+  );
+  pushLog(
+    "info",
+    `[indexer] Smart sync: ${resolveSmartSyncEnabled(config) ? "enabled" : "disabled"} | maxWatcherSyncsPerMinute=${resolveMaxWatcherSyncsPerMinute(config)}`,
   );
   pushLog(
     "info",
@@ -919,6 +1181,7 @@ async function shutdown(signal) {
   shuttingDown = true;
   console.log(`\n[indexer] ${signal} received, shutting down...`);
   if (syncTimer) clearInterval(syncTimer);
+  resetWatcherRateLimiter();
   if (watcherInstance) {
     try {
       await watcherInstance.close();

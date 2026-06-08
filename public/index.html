@@ -106,6 +106,10 @@
           <div class="stat-label">Exceções</div>
           <div class="stat-value" id="exclusionCount">0</div>
         </div>
+        <div class="stat">
+          <div class="stat-label">Smart Sync</div>
+          <div class="stat-value" id="smartSyncStatus">—</div>
+        </div>
       </div>
 
       <div class="flex-between mb-8">
@@ -197,7 +201,26 @@
         </div>
         <div class="form-row">
           <label style="width:160px;flex-shrink:0;font-size:0.85rem">Watch debounce (s)</label>
-          <input type="number" id="cfgWatchDebounce" min="5" max="120">
+          <input type="number" id="cfgWatchDebounce" min="5" max="300">
+        </div>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Watch interval (ms)</label>
+          <input type="number" id="cfgWatchInterval" min="5000" max="60000">
+        </div>
+        <h2 style="margin-top:16px">Smart Sync</h2>
+        <div class="form-row" style="align-items:center">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Smart sync</label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:0.85rem">
+            <input type="checkbox" id="cfgSmartSync">
+            Ativar
+          </label>
+          <span style="margin-left:12px;font-size:0.78rem;color:var(--muted, #888)">
+            Pula pastas sem alteração. Reduz POSTs ao backend ERP.
+          </span>
+        </div>
+        <div class="form-row">
+          <label style="width:160px;flex-shrink:0;font-size:0.85rem">Max syncs/min (watcher)</label>
+          <input type="number" id="cfgMaxSyncsPerMin" min="1" max="120">
         </div>
         <div style="margin-top:12px">
           <button class="btn-primary" onclick="saveConfig()">Salvar configurações</button>
@@ -274,6 +297,9 @@ async function loadStatus() {
       document.getElementById('folderCount').textContent = (d.discoveredFolders || []).length;
       document.getElementById('lastError').textContent = d.lastError || '';
       document.getElementById('btnSync').disabled = d.running;
+
+      const smartEl = document.getElementById('smartSyncStatus');
+      if (smartEl) smartEl.textContent = d.smartSyncEnabled ? 'ON' : 'OFF';
     }
   } catch {}
 
@@ -375,7 +401,10 @@ async function loadConfig() {
   document.getElementById('cfgInterval').value = c.syncIntervalMinutes || 15;
   document.getElementById('cfgThumbConc').value = c.thumbConcurrency || 4;
   document.getElementById('cfgWatchEnabled').checked = c.watchEnabled === true;
-  document.getElementById('cfgWatchDebounce').value = c.watchDebounceSeconds || 15;
+  document.getElementById('cfgWatchDebounce').value = c.watchDebounceSeconds || 90;
+  document.getElementById('cfgWatchInterval').value = c.watchIntervalMs || 15000;
+  document.getElementById('cfgSmartSync').checked = c.smartSyncEnabled !== false;
+  document.getElementById('cfgMaxSyncsPerMin').value = c.maxWatcherSyncsPerMinute || 10;
   document.getElementById('cfgApiKey').value = '';
   document.getElementById('cfgSaveMsg').textContent = '';
 }
@@ -388,6 +417,9 @@ async function saveConfig() {
   const conc = parseInt(document.getElementById('cfgThumbConc').value, 10);
   const watchEnabled = document.getElementById('cfgWatchEnabled').checked;
   const watchDebounce = parseInt(document.getElementById('cfgWatchDebounce').value, 10);
+  const watchInterval = parseInt(document.getElementById('cfgWatchInterval').value, 10);
+  const smartSync = document.getElementById('cfgSmartSync').checked;
+  const maxSyncsPerMin = parseInt(document.getElementById('cfgMaxSyncsPerMin').value, 10);
 
   if (url) body.erpApiUrl = url;
   if (key) body.apiKey = key;
@@ -396,6 +428,13 @@ async function saveConfig() {
   body.watchEnabled = !!watchEnabled;
   if (Number.isFinite(watchDebounce) && watchDebounce > 0) {
     body.watchDebounceSeconds = watchDebounce;
+  }
+  if (Number.isFinite(watchInterval) && watchInterval > 0) {
+    body.watchIntervalMs = watchInterval;
+  }
+  body.smartSyncEnabled = !!smartSync;
+  if (Number.isFinite(maxSyncsPerMin) && maxSyncsPerMin > 0) {
+    body.maxWatcherSyncsPerMinute = maxSyncsPerMin;
   }
 
   await fetch(API + '/api/config', {

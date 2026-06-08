@@ -1,8 +1,8 @@
 {
   "erpApiUrl": "https://erp.seudominio.com.br",
   "apiKey": "MESMA_CHAVE_DO_INDEXER_API_KEY_NO_BACKEND",
-  "syncIntervalMinutes": 15,
-  "thumbConcurrency": 4,
+  "syncIntervalMinutes": 720,
+  "thumbConcurrency": 1,
   "roots": [
     {
       "path": "Z:\\Clientes",
@@ -19,11 +19,20 @@
     { "sourceType": "VAREJO", "folderName": "teste" }
   ],
   "watchEnabled": false,
-  "watchDebounceSeconds": 15,
+  "watchDebounceSeconds": 90,
   "runOnStartup": false,
   "circuitBreakerEnabled": true,
   "circuitBreakerFailureThreshold": 3,
   "circuitBreakerCooldownMinutes": 30,
   "maxConsecutiveSyncErrors": 3,
+  "smartSyncEnabled": true,
+  "folderSignatureCacheEnabled": true,
+  "folderSignatureCachePath": "data/folder-signatures.json",
+  "maxWatcherSyncsPerMinute": 10,
+  "watchUsePolling": true,
+  "watchIntervalMs": 15000,
+  "watchBinaryIntervalMs": 30000,
+  "watchStabilityThresholdMs": 5000,
+  "watchPollIntervalMs": 1000,
   "lastSync": null
 }
