@@ -3,3 +3,7 @@ config.json
 
 thumbs/
 data/
+
+# Skills locais do Claude Code: a de acesso ao servidor traz IP e usuário,
+# e este repositório é público.
+.claude/
