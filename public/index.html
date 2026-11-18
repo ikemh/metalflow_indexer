@@ -133,6 +133,13 @@
           </select>
           <button class="btn-primary btn-sm" onclick="addRoot()">Adicionar</button>
         </div>
+
+        <h2 style="margin-top:16px">Catálogo do site</h2>
+        <p style="margin:4px 0 8px">Pasta com os DXF dos produtos. Só os arquivos da própria pasta entram, sem as subpastas. Vazio desliga.</p>
+        <div class="form-row">
+          <input type="text" id="catalogRootPath" placeholder="Caminho (ex: Z:\Catálogo\Catálogo 2025\DXF)">
+          <button class="btn-primary btn-sm" onclick="saveCatalogRoot()">Salvar</button>
+        </div>
       </div>
     </div>
 
@@ -259,7 +266,7 @@ document.querySelectorAll('.tab').forEach(t => {
     document.getElementById('tab-' + id).classList.remove('hidden');
 
     if (id === 'logs') loadLogs();
-    if (id === 'roots') loadRoots();
+    if (id === 'roots') { loadRoots(); loadCatalogRoot(); }
     if (id === 'config') loadConfig();
     if (id === 'folders') loadFolders();
     if (id === 'exclusions') loadExclusions();
@@ -362,6 +369,22 @@ async function addRoot() {
 
   document.getElementById('newRootPath').value = '';
   loadRoots();
+}
+
+async function loadCatalogRoot() {
+  const r = await fetch(API + '/api/catalog-root');
+  const c = await r.json();
+  document.getElementById('catalogRootPath').value = c.path || '';
+}
+
+async function saveCatalogRoot() {
+  const p = document.getElementById('catalogRootPath').value.trim();
+  await fetch(API + '/api/catalog-root', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path: p }),
+  });
+  loadCatalogRoot();
 }
 
 async function removeRoot(idx) {

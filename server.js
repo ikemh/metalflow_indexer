@@ -44,6 +44,7 @@ const {
   uploadThumbToErp,
   batchSyncToErp,
   reconcileFoldersToErp,
+  syncCatalogToErp,
 } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 const { createWatcher } = require("./lib/watcher");
@@ -365,6 +366,129 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Catálogo — DXFs dos produtos do site
+// ---------------------------------------------------------------------------
+
+/**
+ * Sincroniza a pasta do catálogo (`config.catalogRoot`) com o ERP.
+ *
+ * Mesmo caminho de um cliente — scan, thumb, upload, sync —, com duas
+ * diferenças: só lê a própria pasta, sem descer nas subpastas (lá ficam cópias
+ * antigas e códigos que o site não vende), e manda tudo para
+ * /indexer/catalog/sync, que não cria pasta de cliente. Quem lê o nome do
+ * arquivo e decide de que produto é o desenho é o ERP.
+ */
+async function syncCatalogRoot(config, options = {}) {
+  const { source = "cycle", bypassSmartSync = false } = options;
+  const catalogPath = config.catalogRoot;
+  const normalizedRoot = normalizeRootPath(catalogPath);
+  const result = { fileCount: 0, created: 0, updated: 0, error: null, smartSkipped: false };
+
+  if (!(await isRootAccessible(catalogPath))) {
+    pushLog("error", `[catalog] INACCESSIBLE: ${catalogPath} — skipping`);
+    result.error = "inaccessible";
+    return result;
+  }
+
+  // "CATALOGO" só entra no id estável da thumb e na chave da assinatura, para
+  // não colidir com arquivo de cliente; o backend nunca vê esse valor.
+  const { files, warnings } = await scanFolder(catalogPath, "CATALOGO", "", {
+    recursive: false,
+  });
+  for (const w of warnings) pushLog("warn", `[catalog] ${w.type}: ${w.message}`);
+
+  const isCompleteScan = warnings.length === 0;
+  result.fileCount = files.length;
+
+  const smartEnabled = resolveSmartSyncEnabled(config);
+  const cacheEnabled = resolveFolderSignatureCacheEnabled(config);
+  const sigKey = makeFolderSignatureKey({
+    sourceType: "CATALOGO",
+    rootPath: normalizedRoot,
+    customerFolder: "",
+  });
+  const currentSignature = computeFolderSignature(files);
+
+  if (
+    smartEnabled &&
+    isCompleteScan &&
+    !bypassSmartSync &&
+    source !== "manual-force"
+  ) {
+    const cachedSig = getCachedSignature(sigKey);
+    if (cachedSig && signaturesEqual(currentSignature, cachedSig)) {
+      pushLog("info", `[catalog] skipped unchanged files=${files.length}`);
+      result.smartSkipped = true;
+      return result;
+    }
+  }
+
+  const thumbResult = await generateThumbsForFiles(files, catalogPath, {
+    concurrency: resolveThumbConcurrency(config),
+    customerLabel: "catálogo",
+  });
+  const thumbStats = thumbResult.stats;
+  pushLog(
+    "info",
+    `[thumb] catálogo: ok=${thumbStats.ok} cached=${thumbStats.cached} failed=${thumbStats.failed} timeout=${thumbStats.timeout} missing=${thumbStats.missing} locked=${thumbStats.locked}`,
+  );
+
+  for (const file of thumbResult.files) {
+    if (file.thumbnailPath && !file.thumbCached) {
+      const upload = await uploadThumbToErp(
+        config.erpApiUrl,
+        config.apiKey,
+        file.id,
+        file.thumbnailPath,
+      );
+      if (upload.ok) file.thumbnailUrl = upload.thumbnailUrl;
+      else pushLog("warn", `[catalog] thumb upload failed ${file.fileName}: ${upload.error}`);
+    }
+  }
+
+  // IMPORTANTE: como no sync de cliente, `absolutePath` nunca vai ao backend.
+  const payload = thumbResult.files.map((f) => ({
+    fileName: f.fileName,
+    relativePath: f.relativePath,
+    sizeBytes: f.sizeBytes,
+    lastModifiedAt: f.lastModifiedAt,
+    thumbnailUrl: f.thumbnailUrl || null,
+  }));
+
+  const syncResult = await syncCatalogToErp(
+    config.erpApiUrl,
+    config.apiKey,
+    normalizedRoot,
+    isCompleteScan,
+    payload,
+  );
+
+  if (!syncResult.ok) {
+    recordSyncFailure(config, `catalog: ${syncResult.error}`, pushLog);
+    pushLog("error", `[catalog] FAILED: ${syncResult.error}`);
+    result.error = syncResult.error;
+    return result;
+  }
+
+  recordSyncSuccess(config);
+  const d = syncResult.data || {};
+  result.created = d.created || 0;
+  result.updated = d.updated || 0;
+  pushLog(
+    "info",
+    `[catalog] +${d.created || 0} ~${d.updated || 0} inativos=${d.missingMarked || 0} (${d.total || 0} total)`,
+  );
+
+  const hasTransientThumbIssues =
+    thumbStats.timeout > 0 || thumbStats.locked > 0 || thumbStats.missing > 0;
+  if (cacheEnabled && isCompleteScan && !hasTransientThumbIssues) {
+    setCachedSignature(sigKey, currentSignature);
+  }
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Sync cycle (varredura completa)
 // ---------------------------------------------------------------------------
 
@@ -396,7 +520,7 @@ async function runSyncCycle(options = {}) {
       return { error: "Missing config" };
     }
 
-    if (!config.roots || config.roots.length === 0) {
+    if ((!config.roots || config.roots.length === 0) && !config.catalogRoot) {
       pushLog("error", "[sync] No roots configured");
       return { error: "No roots" };
     }
@@ -511,6 +635,19 @@ async function runSyncCycle(options = {}) {
         if (r.error) totalErrors++;
         if (r.smartSkipped) totalSmartSkipped++;
       }
+    }
+
+    if (
+      config.catalogRoot &&
+      !circuitInterrupted &&
+      (bypassCircuitBreaker || !isCircuitOpen(config))
+    ) {
+      pushLog("info", `[catalog] ${config.catalogRoot}`);
+      const c = await syncCatalogRoot(config);
+      totalFiles += c.fileCount;
+      totalCreated += c.created;
+      totalUpdated += c.updated;
+      if (c.error) totalErrors++;
     }
 
     // Persist signature cache after cycle
@@ -1015,6 +1152,25 @@ app.delete("/api/roots/:index", async (req, res) => {
   res.json({ ok: true });
 });
 
+// --- API: Catálogo ---
+
+app.get("/api/catalog-root", async (_req, res) => {
+  const config = await readConfig();
+  res.json({ path: config.catalogRoot || "" });
+});
+
+app.put("/api/catalog-root", async (req, res) => {
+  const raw = req.body && req.body.path;
+  if (raw !== undefined && typeof raw !== "string") {
+    return res.status(400).json({ error: "path must be a string" });
+  }
+  const config = await readConfig();
+  config.catalogRoot = (raw || "").trim();
+  await writeConfig(config);
+  pushLog("info", `[config] Catalog root: ${config.catalogRoot || "(desligado)"}`);
+  res.json({ ok: true, path: config.catalogRoot });
+});
+
 // --- API: Excluded Folders ---
 
 app.get("/api/exclusions", async (_req, res) => {
@@ -1163,6 +1319,7 @@ async function main() {
     "info",
     `[indexer] Roots: ${(config.roots || []).map((r) => `${r.path} (${r.sourceType})`).join(", ")}`,
   );
+  pushLog("info", `[indexer] Catalog: ${config.catalogRoot || "(desligado)"}`);
   pushLog(
     "info",
     `[indexer] Sync interval: ${minutes}min`,
