@@ -48,6 +48,7 @@ const {
 } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 const { createWatcher } = require("./lib/watcher");
+const { startCutSendLoop } = require("./lib/cut-sends");
 const {
   computeFolderSignature,
   makeFolderSignatureKey,
@@ -1352,6 +1353,9 @@ async function main() {
     );
   }
   syncTimer = setInterval(scheduleCycle, intervalMs);
+
+  // Envio para corte: laço próprio, fora da fila de sync e do circuit breaker.
+  startCutSendLoop({ readConfig, log: pushLog });
 }
 
 // ---------------------------------------------------------------------------
