@@ -50,6 +50,7 @@ const { generateThumbsForFiles } = require("./lib/thumbgen");
 const { createWatcher } = require("./lib/watcher");
 const { attachDims, withDimsVersion } = require("./lib/dims");
 const { startCutSendLoop } = require("./lib/cut-sends");
+const { startCutFileWatch } = require("./lib/cut-files");
 const {
   computeFolderSignature,
   makeFolderSignatureKey,
@@ -1369,6 +1370,8 @@ async function main() {
 
   // Envio para corte: laço próprio, fora da fila de sync e do circuit breaker.
   startCutSendLoop({ readConfig, log: pushLog });
+  // Pasta OK viva: onde está cada arquivo de corte; item separado vai para OK\HIST.
+  startCutFileWatch({ readConfig, log: pushLog });
 }
 
 // ---------------------------------------------------------------------------
