@@ -48,6 +48,7 @@ const {
 } = require("./lib/sync");
 const { generateThumbsForFiles } = require("./lib/thumbgen");
 const { createWatcher } = require("./lib/watcher");
+const { attachDims, withDimsVersion } = require("./lib/dims");
 const { startCutSendLoop } = require("./lib/cut-sends");
 const {
   computeFolderSignature,
@@ -210,11 +211,14 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
 
   if (useSmartSkip || cacheEnabled) {
     currentSignature = computeFolderSignature(files);
-    sigKey = makeFolderSignatureKey({
-      sourceType: root.sourceType,
-      rootPath: normalizedRoot,
-      customerFolder,
-    });
+    sigKey = withDimsVersion(
+      makeFolderSignatureKey({
+        sourceType: root.sourceType,
+        rootPath: normalizedRoot,
+        customerFolder,
+      }),
+      root.sourceType,
+    );
   }
 
   if (useSmartSkip && currentSignature && sigKey) {
@@ -268,6 +272,7 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
   });
   const filesWithThumbs = thumbResult.files;
   const thumbStats = thumbResult.stats;
+  await attachDims(filesWithThumbs, root.sourceType, pushLog);
 
   const hasThumbEvents =
     thumbStats.ok > 0 ||
@@ -318,6 +323,8 @@ async function syncCustomerFolder(config, root, customerFolder, options = {}) {
     sizeBytes: f.sizeBytes,
     lastModifiedAt: f.lastModifiedAt,
     thumbnailUrl: f.thumbnailUrl || null,
+    widthMm: f.widthMm ?? null,
+    heightMm: f.heightMm ?? null,
   }));
 
   const syncResult = await batchSyncToErp(
@@ -403,11 +410,14 @@ async function syncCatalogRoot(config, options = {}) {
 
   const smartEnabled = resolveSmartSyncEnabled(config);
   const cacheEnabled = resolveFolderSignatureCacheEnabled(config);
-  const sigKey = makeFolderSignatureKey({
-    sourceType: "CATALOGO",
-    rootPath: normalizedRoot,
-    customerFolder: "",
-  });
+  const sigKey = withDimsVersion(
+    makeFolderSignatureKey({
+      sourceType: "CATALOGO",
+      rootPath: normalizedRoot,
+      customerFolder: "",
+    }),
+    "CATALOGO",
+  );
   const currentSignature = computeFolderSignature(files);
 
   if (
@@ -429,6 +439,7 @@ async function syncCatalogRoot(config, options = {}) {
     customerLabel: "catálogo",
   });
   const thumbStats = thumbResult.stats;
+  await attachDims(thumbResult.files, "CATALOGO", pushLog);
   pushLog(
     "info",
     `[thumb] catálogo: ok=${thumbStats.ok} cached=${thumbStats.cached} failed=${thumbStats.failed} timeout=${thumbStats.timeout} missing=${thumbStats.missing} locked=${thumbStats.locked}`,
@@ -454,6 +465,8 @@ async function syncCatalogRoot(config, options = {}) {
     sizeBytes: f.sizeBytes,
     lastModifiedAt: f.lastModifiedAt,
     thumbnailUrl: f.thumbnailUrl || null,
+    widthMm: f.widthMm ?? null,
+    heightMm: f.heightMm ?? null,
   }));
 
   const syncResult = await syncCatalogToErp(
